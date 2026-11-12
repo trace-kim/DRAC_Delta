@@ -9,10 +9,11 @@ behind each algorithmic choice are in AffineRANSAC's `docs/SPEC.md`, stage S2: r
 works.
 
 ## Commands
-Windows, Python 3.13, a venv in `.venv` (gitignored):
+Windows, Python 3.13, a venv in `.venv` (gitignored). Packaging and pytest settings are in `pyproject.toml`; the
+library needs no Qt (`pip install .`), the viewer's packages are the `viewer` extra, and `dev` adds pytest to them:
 ```
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python -m pip install -e ".[dev]"
 .venv\Scripts\python -m pytest                                      # all tests (~20 s)
 .venv\Scripts\python -m pytest tests/test_refine.py                 # one step
 .venv\Scripts\python -m pytest tests/test_refine.py -k mid_level    # tests whose name matches

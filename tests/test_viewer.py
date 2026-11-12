@@ -10,6 +10,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # no window on the screen
 
 import numpy as np
 import pytest
+
+for package in ("PySide6", "pyqtgraph"):  # the viewer's packages are optional: pip install -e ".[viewer]"
+    pytest.importorskip(package, reason="the viewer's packages are not installed (pip install -e .[viewer])")
+
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 import viewer

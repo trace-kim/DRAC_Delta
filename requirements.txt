@@ -1,6 +1,0 @@
-numpy
-opencv-python-headless
-scikit-image
-pyqtgraph
-PySide6
-pytest

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contour-extraction"
+version = "0.1.0"
+description = "Contour extraction of contact holes in SEM images"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "scikit-image",
+]
+
+[project.optional-dependencies]
+# The viewer (viewer.py, run from a checkout): a Qt window to try the options on real images.
+viewer = ["pyqtgraph", "PySide6"]
+# Development: the tests, with the viewer's packages for tests/test_viewer.py (skipped without them).
+# Install with:  pip install -e ".[dev]"
+dev = ["contour-extraction[viewer]", "pytest"]
+
+[tool.setuptools]
+packages = ["contour_extraction"]  # the library only: viewer.py and tests/ are not installed
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]  # viewer.py, at the repo root
