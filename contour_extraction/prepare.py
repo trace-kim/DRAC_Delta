@@ -2,14 +2,15 @@
 
 Each part is optional: flatten_background() removes brightness that varies across the image (charging, shading), so
 that one threshold fits the whole image; denoised_image() removes pixel noise; upscaled_image() interpolates the image
-to more pixels, and in_image_pixels() puts the contacts found in it back in the image's own pixels.
+to more pixels, and in_image_pixels() puts the contacts found in it back in the image's own pixels (in_image_contours():
+the contours of any pattern).
 """
 
 import cv2
 import numpy as np
 from skimage.restoration import denoise_tv_chambolle
 
-from .contacts import DetectedContacts
+from .contacts import Contours, DetectedContacts
 
 DENOISERS = ("none", "median", "non-local means", "total variation")  # denoised_image methods
 NLM_PATCH_PX, NLM_SEARCH_PX = 7, 21  # non-local means: patch and search window, OpenCV's recommended sizes
@@ -80,6 +81,15 @@ def in_image_pixels(contacts: DetectedContacts, factor: int) -> DetectedContacts
         return (xy + 0.5) / factor - 0.5
     return DetectedContacts(back(contacts.centers), contacts.areas / factor ** 2, [back(c) for c in contacts.contours],
                             contacts.threshold, contacts.left_out)
+
+
+def in_image_contours(contours: Contours, factor: int) -> Contours:
+    """Contours of any pattern found in an image upscaled by `factor` (upscaled_image), in the pixel frame of the image
+    itself (their normals are directions: the same in both)."""
+    if factor == 1:
+        return contours
+    points = [(p + 0.5) / factor - 0.5 for p in contours.points]
+    return Contours(points, contours.normals, contours.closed, contours.region, contours.threshold, contours.left_out)
 
 
 def prepared_image(image: np.ndarray, background_px: float = 0.0, dark_contacts: bool = True, denoise: str = "none",

@@ -68,6 +68,15 @@ def test_isolated_points_take_their_neighbours_median_and_a_real_bump_stays():
     assert cleaned.sum() == pytest.approx(13.5)  # the bump's steps are rounded, its area kept
 
 
+def test_an_open_contour_has_no_neighbours_past_its_ends():
+    ramp = np.linspace(0.0, 10.0, 50)  # a contour closed over its ends would see 10 beside 0
+    np.testing.assert_array_equal(without_isolated(ramp, closed=False), ramp)
+    assert without_isolated(ramp)[0] != ramp[0]
+    spike = ramp.copy()
+    spike[0] = 5.0  # isolated, with neighbours on one side only
+    assert without_isolated(spike, closed=False)[0] == pytest.approx(np.median(ramp[1:4]))
+
+
 def distance_to_ellipse(points, center, semi_axes):
     """Distance (px) from each point to the nearest point of the ellipse outline."""
     t = np.linspace(0, 2 * np.pi, 20000)

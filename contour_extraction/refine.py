@@ -4,14 +4,19 @@ Every point of a detected contour is moved along its own outward normal, within 
 its edge on a lightly smoothed copy of the image. Where the edge is depends on the rule (RULES; see refine_edges).
 No radius or centre is assumed, so this works for any contact shape (circle, ellipse, rectangle, ...). The refined
 centre is the area centroid of the refined contour.
+
+refine_contours() does the same for the contours of any pattern (detect.detect_contours), closed or open: each point
+moves along the direction its edge faces, given by the detection, by the same rules.
 """
 
 import warnings
+from collections import defaultdict
 
 import cv2
 import numpy as np
+from scipy import ndimage
 
-from .contacts import DetectedContacts, polygon_area, polygon_centroid
+from .contacts import Contours, DetectedContacts, polygon_area, polygon_centroid
 
 RULES = ("mid-level", "steepest gradient", "threshold")  # refine_edges edge rules
 
@@ -95,13 +100,20 @@ def level_offsets(profiles: np.ndarray, offsets: np.ndarray, interior: float) ->
     return crossings(profiles, offsets, (interior + band) / 2)
 
 
-def without_isolated(shifts: np.ndarray, neighbours: int = 3, tolerance_px: float = 0.5) -> np.ndarray:
+def without_isolated(shifts: np.ndarray, neighbours: int = 3, tolerance_px: float = 0.5,
+                     closed: bool = True) -> np.ndarray:
     """Shifts (M,) of the points of one closed contour, where a shift that is NaN, or further from the median of its
     `neighbours` on each side than 4 robust sigma (of all its points) + tolerance_px, is replaced by that median (0 if
-    its neighbours have none either). A real deviation of the edge spans several neighbouring points and is kept."""
+    its neighbours have none either). A real deviation of the edge spans several neighbouring points and is kept.
+    closed False: the points of an open contour (refine_contours), whose first and last points have neighbours on one
+    side only."""
     steps = np.array([k for k in range(-neighbours, neighbours + 1) if k])
     index = np.arange(len(shifts))[:, None] + steps
-    around = np.sort(shifts[index % len(shifts)], axis=1)  # NaN sort last
+    if closed:
+        around = shifts[index % len(shifts)]
+    else:  # past either end: no neighbour (NaN)
+        around = np.where((index >= 0) & (index < len(shifts)), shifts[np.clip(index, 0, len(shifts) - 1)], np.nan)
+    around = np.sort(around, axis=1)  # NaN sort last
     found = np.isfinite(around).sum(axis=1, keepdims=True)
     # the median of each point's finite neighbours: the middle one or two of them (none: NaN, as every value is)
     median = (np.take_along_axis(around, (found - 1) // 2, axis=1) + np.take_along_axis(around, found // 2, axis=1))
@@ -182,3 +194,49 @@ def refine_edges(
         threshold=contacts.threshold,
         left_out=contacts.left_out,
     )
+
+
+def refine_contours(image: np.ndarray, contours: Contours, labels: np.ndarray, dark: bool = True,
+                    search_px: float = 5.0, step_px: float = 0.25, blur_sigma: float = 1.0,
+                    rule: str = "mid-level") -> Contours:
+    """The contours of any pattern (detect.detect_contours) with each point moved along its direction (searched from
+    -search_px to +search_px in steps of step_px) to its edge by `rule`, on the image smoothed with a Gaussian of
+    blur_sigma, as refine_edges moves a contact's points. labels: detect_contours' region numbers.
+    Mid-level: each region has its own two levels (mid_levels), as each contact. "mid-level" and "threshold": points
+    without a crossing, or isolated, take the median of their neighbours along their contour (without_isolated; an
+    open contour has none past its ends). dark False: the same rules on the negative image.
+    """
+    if rule not in RULES:
+        raise ValueError(f"rule must be one of {RULES}, not {rule!r}")
+    if not contours.points:
+        return contours
+    sign = 1.0 if dark else -1.0  # bright regions: the rules on the negative image, as for contacts
+    image = image.astype(np.float32)
+    signed = sign * (cv2.GaussianBlur(image, (0, 0), blur_sigma) if blur_sigma > 0 else image)
+    offsets = np.arange(-search_px, search_px + step_px / 2, step_px)
+    all_points, all_normals = np.concatenate(contours.points), np.concatenate(contours.normals)
+    profiles = sample_profiles(signed, all_points, all_normals, offsets)  # each rises going out of its region
+    starts = np.cumsum([len(p) for p in contours.points])[:-1]
+    parts = np.split(profiles, starts)
+    if rule == "steepest gradient":
+        shifts = np.split(edge_offsets(profiles, offsets), starts)
+    else:
+        levels = [sign * contours.threshold] * len(parts) if rule == "threshold" else \
+            mid_levels(signed, labels, contours.region, parts, offsets)
+        shifts = [without_isolated(crossings(part, offsets, level), closed=whole)
+                  for part, level, whole in zip(parts, levels, contours.closed)]
+    moved = [p + shift[:, None] * n for p, shift, n in zip(contours.points, shifts, contours.normals)]
+    return Contours(moved, contours.normals, contours.closed, contours.region, contours.threshold, contours.left_out)
+
+
+def mid_levels(signed: np.ndarray, labels: np.ndarray, region: np.ndarray, parts: list[np.ndarray],
+               offsets: np.ndarray) -> list[float]:
+    """Per contour, the edge level of its region: half-way between the region's interior (the median of `signed` over
+    its pixels) and its band (the median over the profiles of all its contours of their brightest value from the start
+    outward), as level_offsets for one contact. parts: the profiles (M, T) of each contour."""
+    numbers = np.unique(region)
+    interior = dict(zip(numbers, ndimage.median(signed, labels, numbers)))
+    brightest = defaultdict(list)
+    for number, part in zip(region, parts):
+        brightest[number].append(part[:, offsets >= 0].max(axis=1))
+    return [(interior[number] + np.median(np.concatenate(brightest[number]))) / 2 for number in region]

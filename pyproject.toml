@@ -5,12 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "contour-extraction"
 version = "0.1.0"
-description = "Contour extraction of contact holes in SEM images"
+description = "Contour extraction of contact holes, and of any pattern, in SEM images"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "opencv-python-headless",
     "scikit-image",
+    "scipy",
 ]
 
 [project.optional-dependencies]

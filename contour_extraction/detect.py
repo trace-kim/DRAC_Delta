@@ -4,17 +4,25 @@ Blur slightly, threshold to a mask of candidate contact pixels (contact_mask: "o
 mask into connected regions, drop the regions that are not contacts (touching the border, too small or too large, not
 solid enough); each region left is a contact: centre = centroid of its pixels, contour = its outer boundary, a pixel
 staircase that step 5 (refine) moves to the sub-pixel edge.
+
+Or the contours of any pattern (detect_contours, AffineRANSAC D155), nothing assumed about it: no shape, size or
+direction, and a region need not lie inside the image. Every region of the same mask (within the area limits) gives its
+whole boundary: its outer one and that of each hole in it. The points on the image's outermost rows and columns are not
+edges (the region runs out of the image there) and are taken out (inside_image): a boundary that never gets there is
+one closed contour, the others fall into open contours, each ending at the image border. Each point has the direction
+its edge faces, out of its region, which step 5 moves it along (refine_contours).
 """
 
 import cv2
 import numpy as np
 from skimage.filters import threshold_multiotsu
 
-from .contacts import DetectedContacts
+from .contacts import Contours, DetectedContacts
 
 METHODS = ("otsu", "otsu3", "band")  # detect_contacts threshold methods
 BAND_MIN_SOLIDITY = 0.9  # "band": regions less solid than this are background pinched off between bands
 LEFT_OUT = ("border", "small", "large", "not solid")  # why a region is not a contact
+CONTOUR_LEFT_OUT = ("small", "large")  # why a region gives no contour (detect_contours)
 
 
 def contact_mask(image: np.ndarray, dark_contacts: bool = True, blur_sigma: float = 1.5, method: str = "otsu"):
@@ -112,3 +120,77 @@ def detect_contacts(
         threshold=float(threshold),
         left_out=left_out,
     )
+
+
+def detect_contours(image: np.ndarray, dark: bool = True, blur_sigma: float = 1.5, min_area_px: int = 20,
+                    max_area_px: int | None = None, method: str = "otsu",
+                    normal_span: int = 3) -> tuple[Contours, np.ndarray]:
+    """The contours of any pattern in a grayscale uint8 image (module docstring), and the region number of every pixel
+    (0: none), which refine_contours needs. dark: the regions are the darker side.
+
+    The mask of contact_mask is split into connected regions ("band": 4-connected) as for contacts; a region of an area
+    outside [min_area_px, max_area_px] (max None: no limit) is left out (counted in left_out). The normals: a tangent
+    across +-normal_span points (right_of_tangent), out of the region (a hole's: into the hole).
+    """
+    mask, threshold = contact_mask(image, dark, blur_sigma, method)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4 if method == "band" else 8)
+    points, normals, closed, region = [], [], [], []
+    left_out = dict.fromkeys(CONTOUR_LEFT_OUT, 0)
+    for label in range(1, count):  # label 0 is not mask
+        left, top, width, height, area = stats[label]
+        if area < min_area_px:
+            left_out["small"] += 1
+            continue
+        if max_area_px is not None and area > max_area_px:
+            left_out["large"] += 1
+            continue
+        pixels = (labels[top:top + height, left:left + width] == label).astype(np.uint8)
+        boundaries, hierarchy = cv2.findContours(pixels, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+        for boundary, (_, _, _, parent) in zip(boundaries, hierarchy[0]):
+            boundary = boundary.reshape(-1, 2).astype(float) + [left, top]  # crop -> image coordinates
+            side = out_of_polygon(boundary) * (-1.0 if parent >= 0 else 1.0)  # a hole: out of the region is into it
+            for piece, whole in inside_image(boundary, mask.shape):
+                points.append(piece)
+                normals.append(side * right_of_tangent(piece, normal_span, whole))
+                closed.append(whole)
+                region.append(label)
+    return Contours(points, normals, np.array(closed, bool), np.array(region, int), float(threshold), left_out), labels
+
+
+def out_of_polygon(boundary: np.ndarray) -> float:
+    """+1 if right_of_tangent's vectors point out of a closed boundary (M, 2), -1 if into it: by the sign of its area,
+    as refine.outward_normals."""
+    x, y = boundary[:, 0], boundary[:, 1]
+    signed_area = (x * np.roll(y, -1) - np.roll(x, -1) * y).sum() / 2
+    return 1.0 if signed_area > 0 else -1.0
+
+
+def inside_image(boundary: np.ndarray, shape: tuple[int, int]) -> list[tuple[np.ndarray, bool]]:
+    """A closed boundary (M, 2) without its points on the outermost rows and columns of an image of this shape:
+    [(points, closed)]. None there: the boundary itself, closed. Otherwise the runs of points between them, each open
+    (runs of fewer than 2 points are dropped: no direction)."""
+    rows, cols = shape
+    x, y = boundary[:, 0], boundary[:, 1]
+    on_border = (x == 0) | (y == 0) | (x == cols - 1) | (y == rows - 1)
+    if not on_border.any():
+        return [(boundary, True)]
+    start = np.flatnonzero(on_border)[0]  # begin on the border, so that no run goes on from the last point to the first
+    boundary, on_border = np.roll(boundary, -start, axis=0), np.roll(on_border, -start)
+    runs = np.split(boundary, np.flatnonzero(np.diff(on_border)) + 1)  # in turn on the border, off it, on it, ...
+    return [(run, False) for run in runs[1::2] if len(run) >= 2]
+
+
+def right_of_tangent(points: np.ndarray, span: int, closed: bool) -> np.ndarray:
+    """(M, 2) unit vectors at right angles to a contour (M, 2): (ty, -tx) of its unit tangent (tx, ty), all on the same
+    side of it. The tangent at point k runs from point k - span to point k + span, which smooths the pixel staircase;
+    an open contour's stops at its ends. Where the two coincide (the tip of a 1 px wide spur) there is no tangent:
+    (0, 0), so the point is not moved."""
+    k = np.arange(len(points))
+    if closed:
+        ahead, behind = points[(k + span) % len(points)], points[(k - span) % len(points)]
+    else:
+        ahead, behind = points[np.minimum(k + span, len(points) - 1)], points[np.maximum(k - span, 0)]
+    tangent = ahead - behind
+    length = np.linalg.norm(tangent, axis=1, keepdims=True)
+    tangent = np.divide(tangent, length, out=np.zeros_like(tangent), where=length > 0)
+    return np.column_stack([tangent[:, 1], -tangent[:, 0]])

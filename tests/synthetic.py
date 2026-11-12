@@ -113,6 +113,47 @@ def ramp_image():
     return np.clip(60 + 140 * xx / 299 - 50 * (distance <= 7), 0, 255).astype(np.uint8), centres, distance
 
 
+# --- Patterns of any shape (extract_any_contours), from AffineRANSAC's tests/test_contours.py ------------------------
+
+def shape_image(inside, shape=(200, 300), dark=60.0, bright=180.0, blur=1.0, noise=0.0, seed=0) -> np.ndarray:
+    """A bright pattern on a dark background (uint8): inside(x, y) says where the pattern is (px, y down); each pixel's
+    brightness from the share of it the pattern covers (8 x 8 samples), blurred (Gaussian, sigma blur px), with
+    Gaussian noise."""
+    rows, cols = shape
+    fine = (np.arange(8) + 0.5) / 8 - 0.5
+    y = (np.arange(rows)[:, None] + fine).reshape(-1, 1)
+    x = (np.arange(cols)[:, None] + fine).reshape(1, -1)
+    cover = np.broadcast_to(inside(x, y), (rows * 8, cols * 8)).reshape(rows, 8, cols, 8).mean(axis=(1, 3))
+    image = cv2.GaussianBlur(dark + (bright - dark) * cover, (0, 0), blur)
+    image += np.random.default_rng(seed).normal(0, noise, shape)
+    return np.clip(np.round(image), 0, 255).astype(np.uint8)
+
+
+VERTICAL_EDGES_X = (60.3, 85.7, 180.0, 201.4)  # vertical_lines: the x of each edge, from the left
+
+
+def vertical_lines(x, y):
+    """Two lines from the top to the bottom of the image, between the edges VERTICAL_EDGES_X."""
+    return ((x > 60.3) & (x < 85.7)) | ((x > 180.0) & (x < 201.4))
+
+
+def diagonal_line(x, y):
+    """A line 24 px wide, 30 degrees off the x axis, across the whole image: its middle through (150, 100)."""
+    return np.abs(across_diagonal(x, y)) < 12
+
+
+def across_diagonal(x, y):
+    """Distance (px) of (x, y) from the diagonal line's middle, across the line."""
+    angle = np.radians(30)
+    return -(x - 150) * np.sin(angle) + (y - 100) * np.cos(angle)
+
+
+def ring(x, y):
+    """A ring around (150, 100): from radius 30.4 to 55.2."""
+    r = np.hypot(x - 150, y - 100)
+    return (r > 30.4) & (r < 55.2)
+
+
 def centre_errors(found: np.ndarray, truth: np.ndarray) -> np.ndarray:
     """(N, 2) found - true centre of every true contact (its nearest found centre)."""
     nearest = np.linalg.norm(truth[:, None, :] - found[None, :, :], axis=2).argmin(axis=1)

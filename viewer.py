@@ -5,6 +5,8 @@
 It shows the image (as loaded, or as prepared: the image the contacts are found in), the threshold mask, and the
 detected and refined contours and centres over it. Every change of an option finds the contacts again, in a background
 thread, for the newest options only; one line says how many were found and why the other regions were left out.
+With pattern contours it finds the contours of any pattern instead (extract_any_contours): every region's outline,
+closed, or open where the region runs out of the image; the line says how many are closed and how many open.
 Open an image with Open image... (Ctrl+O), by dropping its file on the window, or by naming it on the command line.
 
 Not part of the contour_extraction package, which needs no Qt: a caller of it like any other. The window follows
@@ -24,18 +26,28 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from contour_extraction import (DENOISERS, METHODS, REFINEMENTS, DetectedContacts, contact_mask, crop_databar,
-                                extract_contours, load_sem_image, prepared_image, upscaled_image)
+from contour_extraction import (DENOISERS, METHODS, REFINEMENTS, Contours, DetectedContacts, contact_mask,
+                                crop_databar, extract_any_contours, extract_contours, load_sem_image, prepared_image,
+                                upscaled_image)
 
-# The options: the data bar to crop (load step), then every option of extract_contours with its default, by step.
-DEFAULTS = {"databar_rows": 0} | {name: p.default for name, p in inspect.signature(extract_contours).parameters.items()
-                                  if p.kind is p.KEYWORD_ONLY}
-GROUPS = (("Load", ("databar_rows",)),
+
+def keywords(function) -> dict:
+    """A function's options given by name only, with their defaults."""
+    return {name: p.default for name, p in inspect.signature(function).parameters.items() if p.kind is p.KEYWORD_ONLY}
+
+
+PATTERNS = ("contacts", "contours")  # what the image shows: found by extract_contours | extract_any_contours
+CONTACT_OPTIONS, CONTOUR_OPTIONS = tuple(keywords(extract_contours)), tuple(keywords(extract_any_contours))
+# The options: the pattern, the data bar to crop (load step), then every option of extract_contours with its default,
+# by step; extract_any_contours takes some of them (the same defaults).
+DEFAULTS = {"pattern": "contacts", "databar_rows": 0} | keywords(extract_contours)
+GROUPS = (("Pattern", ("pattern",)),
+          ("Load", ("databar_rows",)),
           ("Prepare", ("background_px", "denoise", "median_px", "nlm_h", "tv_weight", "upscale")),
           ("Detect", ("detection", "dark_contacts", "detection_blur_px", "min_area_px", "max_area_px", "min_solidity")),
           ("Check", ("min_contrast",)),
           ("Refine", ("refinement", "search_px", "edge_step_px", "edge_blur_px", "normal_span")))
-CHOICES = {"denoise": DENOISERS, "detection": METHODS, "refinement": REFINEMENTS}
+CHOICES = {"pattern": PATTERNS, "denoise": DENOISERS, "detection": METHODS, "refinement": REFINEMENTS}
 LIMITS = {"databar_rows": (0, 10000, 1), "background_px": (0, 2000, 5), "median_px": (3, 99, 2), "nlm_h": (0, 100, 1),
           "tv_weight": (0, 10, 0.01), "upscale": (1, 8, 1), "detection_blur_px": (0, 50, 0.1),
           "min_area_px": (0, 10 ** 8, 5), "max_area_px": (0, 10 ** 8, 100), "min_solidity": (0, 1, 0.01),
@@ -44,6 +56,11 @@ LIMITS = {"databar_rows": (0, 10000, 1), "background_px": (0, 2000, 5), "median_
 DENOISER_OPTIONS = {"median_px": "median", "nlm_h": "non-local means", "tv_weight": "total variation"}  # each's own
 REFINE_OPTIONS = ("search_px", "edge_step_px", "edge_blur_px", "normal_span")  # unused with refinement none
 HELP = {  # what each option does (its tooltip); as AffineRANSAC's analysis.Settings says it
+    "pattern": "What the image shows. contacts: contact holes, each a closed contour with a centre; those cut by the "
+               "image border are left out (extract_contours). contours: any pattern, the outline of every region of "
+               "the threshold mask, of any shape and direction, its holes' too: closed where the region lies inside "
+               "the image, open where it runs out of it (extract_any_contours); no centres, no solidity limit and no "
+               "contrast check",
     "databar_rows": "Rows of the SEM data bar along the bottom of the image, cropped off before anything else; 0 = "
                     "none. Until the contacts are found the whole image shows: the cursor's y says where the bar starts",
     "background_px": "Flatten the background first, so that one threshold fits the whole image when its brightness "
@@ -66,8 +83,8 @@ HELP = {  # what each option does (its tooltip); as AffineRANSAC's analysis.Sett
                  "edge). otsu: the dark regions, for images without a bright band. otsu3: the regions darker than the "
                  "background; finds contacts whose band noise breaks up, but more false regions. band: the regions a "
                  "bright band encloses, however grey the hole",
-    "dark_contacts": "Contacts darker than the background (holes, with a bright band); off: brighter. Detection and "
-                     "edge refinement",
+    "dark_contacts": "Contacts darker than the background (holes, with a bright band); off: brighter. Contours: the "
+                     "regions outlined are the darker side; off: the brighter. Detection and edge refinement",
     "detection_blur_px": "Detection: Gaussian blur (sigma, px) of the image before thresholding; 0 = none",
     "min_area_px": "Detection: regions of fewer pixels (px²) are left out (noise)",
     "max_area_px": "Detection: regions of more pixels (px²) are left out; 0 = no limit",
@@ -93,32 +110,39 @@ DETECTED, REFINED, THRESHOLD = "#c2189b", "#00a8c8", "#e8b500"  # the colours of
 FAILURE, MUTED = "#e34948", "#77766f"
 IMAGE_FILES = "SEM images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)"
 NO_IMAGE = ("Open an SEM image (<i>Open image...</i>, Ctrl+O, or drop its file on the window) to see the contacts "
-            "extract_contours finds in it. Hover an option to see what it does.")
+            "extract_contours finds in it (pattern contours: the contours of any pattern). Hover an option to see "
+            "what it does.")
 
 
 @dataclass
 class Found:
-    """The contacts of one image with one set of options, and the images to show them on."""
+    """The contacts (or contours) of one image with one set of options, and the images to show them on."""
     options: dict               # the options they were found with
     image: np.ndarray           # the image as loaded, its data bar cropped: the pixel frame of everything below
     prepared: np.ndarray        # the image the contacts are found in (prepared_image), upscaled: more pixels, same area
     mask: np.ndarray            # uint8, the pixels of `prepared`: 1 = taken as contact by the threshold
-    detected: DetectedContacts  # after the contrast check
-    refined: DetectedContacts   # refinement none: the detected ones
-    dropped: int                # detected contacts the contrast check dropped
+    detected: DetectedContacts | Contours  # contacts: after the contrast check; pattern contours: Contours
+    refined: DetectedContacts | Contours   # refinement none: the detected ones
+    dropped: int                # detected contacts the contrast check dropped (contours: none)
     seconds: float              # time extract_contours took (with the preparation)
 
 
 def find(loaded: np.ndarray, options: dict) -> Found:
-    """The contacts extract_contours finds in the loaded image with these options (databar_rows: cropped off first),
-    and the prepared image and threshold mask to show them on."""
+    """The contacts extract_contours finds in the loaded image with these options (databar_rows: cropped off first;
+    pattern contours: the contours extract_any_contours finds), and the prepared image and threshold mask to show
+    them on."""
     options = dict(options)
     image = crop_databar(loaded, options.pop("databar_rows"))
     start = time.perf_counter()
     # Prepared here, to show it; extract_contours, given it with background_px 0 and denoise none, uses it as it is.
     flat = prepared_image(image, options["background_px"], options["dark_contacts"], options["denoise"],
                           options["median_px"], options["nlm_h"], options["tv_weight"])
-    detected, refined, dropped = extract_contours(flat, **(options | {"background_px": 0.0, "denoise": "none"}))
+    given = options | {"background_px": 0.0, "denoise": "none"}
+    if options["pattern"] == "contours":
+        detected, refined = extract_any_contours(flat, **{name: given[name] for name in CONTOUR_OPTIONS})
+        dropped = 0
+    else:
+        detected, refined, dropped = extract_contours(flat, **{name: given[name] for name in CONTACT_OPTIONS})
     seconds = time.perf_counter() - start
     f = options["upscale"]
     prepared = upscaled_image(flat, f)  # as extract_contours upscales it, its blur in pixels of the image as given
@@ -127,18 +151,24 @@ def find(loaded: np.ndarray, options: dict) -> Found:
 
 
 def summary(found: Found) -> str:
-    """How many contacts were found, how large, and why the other regions were left out, in words (HTML)."""
+    """How many contacts were found, how large, and why the other regions were left out, in words (HTML); pattern
+    contours: how many contours, how many closed and open."""
     o = found.options
     reasons = {"border": "touching the image border", "small": f"smaller than {o['min_area_px']} px²",
                "large": f"larger than {o['max_area_px']} px²", "not solid": f"less solid than {o['min_solidity']:g}"}
     left_out = [f"{count} {reasons.get(why, why)}" for why, count in found.detected.left_out.items() if count]
     if found.dropped:
         left_out.append(f"{found.dropped} below the contrast of {o['min_contrast']:g} noise σ")
-    areas = found.refined.areas
-    text = f"<b>{len(areas)} contacts</b>"
-    if len(areas):
-        median = float(np.median(areas))
-        text += f", median area {median:.1f} px² (diameter {2 * np.sqrt(median / np.pi):.2f} px)"
+    if isinstance(found.refined, Contours):
+        closed = found.refined.closed
+        text = (f"<b>{len(closed)} contours</b>: {int(closed.sum())} closed, {int((~closed).sum())} open (ending at "
+                f"the image border)")
+    else:
+        areas = found.refined.areas
+        text = f"<b>{len(areas)} contacts</b>"
+        if len(areas):
+            median = float(np.median(areas))
+            text += f", median area {median:.1f} px² (diameter {2 * np.sqrt(median / np.pi):.2f} px)"
     text += (f"; {o['detection']} threshold at grey level {found.detected.threshold:.0f}{of_the_image(o)}; "
              f"{found.seconds:.2f} s. ")
     return text + (f"Left out: {', '.join(left_out)}." if left_out else "")
@@ -154,17 +184,23 @@ def of_the_image(options: dict) -> str:
     return f" of the image {steps[0]}" if steps else ""
 
 
-def outlines(contours: list[np.ndarray]) -> np.ndarray:
+def outlines(contours: list[np.ndarray], closed: np.ndarray | None = None) -> np.ndarray:
     """The contours (each (M, 2)) as one (rows, 2) line to draw with connect="finite": each closed (its first point
-    again) and followed by a NaN row, so that one plot item draws them all."""
+    again; closed (N,) bool given: only those True, the others open, as they are) and followed by a NaN row, so that
+    one plot item draws them all."""
     nan = np.full((1, 2), np.nan)
-    parts = [part for contour in contours for part in (contour, contour[:1], nan)]
+    closed = np.ones(len(contours), bool) if closed is None else closed
+    parts = [part for contour, whole in zip(contours, closed)
+             for part in ((contour, contour[:1], nan) if whole else (contour, nan))]
     return np.concatenate(parts) if parts else np.empty((0, 2))
 
 
 def applies(name: str, options: dict) -> bool:
-    """Whether an option changes anything, given the others: min_solidity for band only, each denoiser's option for
-    that denoiser only, the refinement's options unless refinement is none."""
+    """Whether an option changes anything, given the others: for pattern contours only extract_any_contours' options,
+    min_solidity for band only, each denoiser's option for that denoiser only, the refinement's options unless
+    refinement is none."""
+    if options["pattern"] == "contours" and name in CONTACT_OPTIONS and name not in CONTOUR_OPTIONS:
+        return False
     if name == "min_solidity":
         return options["detection"] == "band"
     if name in DENOISER_OPTIONS:
@@ -283,7 +319,8 @@ class Viewer(QtWidgets.QMainWindow):
         self.boxes["Prepared image"].setToolTip(tip("The image the contacts are found in: flattened, denoised and "
                                                     "upscaled as the options say. Off: the image as loaded"))
         self.boxes["Threshold mask"].setToolTip(tip("The pixels the threshold takes as contact (for band: everything "
-                                                    "but the bright band), before the regions are checked"))
+                                                    "but the bright band), before the regions are checked; pattern "
+                                                    "contours: the regions whose outlines are drawn"))
         show.addStretch(1)
 
         # The options, by step; what each does in its tooltip.
@@ -394,8 +431,8 @@ class Viewer(QtWidgets.QMainWindow):
 
     def _start(self):
         self.running = True
-        self.busy.setText("Finding the contacts...")
         number, loaded, options = self.request, self.loaded, self.options()
+        self.busy.setText(f"Finding the {options['pattern']}...")
 
         def work():
             try:
@@ -417,7 +454,8 @@ class Viewer(QtWidgets.QMainWindow):
         self.result = None if isinstance(found, Exception) else found
         self.show_result()
         if isinstance(found, Exception):
-            self.summary.setText(f"<span style='color:{FAILURE}'>No contacts found: {type(found).__name__}: "
+            self.summary.setText(f"<span style='color:{FAILURE}'>No {self.options()['pattern']} found: "
+                                 f"{type(found).__name__}: "
                                  f"{html.escape(str(found))}</span>")
 
     def show_result(self):
@@ -432,8 +470,10 @@ class Viewer(QtWidgets.QMainWindow):
             self.items["Threshold mask"].setImage(found.mask, levels=(0, 1))
             place(self.items["Threshold mask"], found.image.shape)
             for name, contacts in (("Detected", found.detected), ("Refined", found.refined)):
-                xy = outlines(contacts.contours)
-                centres = np.asarray(contacts.centers, float).reshape(-1, 2)
+                if isinstance(contacts, Contours):  # pattern contours: closed or open, no centres
+                    xy, centres = outlines(contacts.points, contacts.closed), np.empty((0, 2))
+                else:
+                    xy, centres = outlines(contacts.contours), np.asarray(contacts.centers, float).reshape(-1, 2)
                 self.items[f"{name} contours"].setData(xy[:, 0], xy[:, 1], connect="finite")
                 self.items[f"{name} centres"].setData(centres[:, 0], centres[:, 1])
             self.summary.setText(summary(found))
@@ -457,8 +497,10 @@ class Viewer(QtWidgets.QMainWindow):
         """Show the layers ticked (and offered); the legend lists the contours and centres shown, each with the
         detection method or edge rule it comes from."""
         o = self.result.options if self.result else self.options()
-        for name in ("Refined contours", "Refined centres"):  # refinement none: the refined ones are the detected
-            self.boxes[name].setEnabled(self.options()["refinement"] != "none")
+        shown = self.options()
+        for name in LAYERS[2:]:  # refinement none: the refined ones are the detected; only contacts have centres
+            self.boxes[name].setEnabled(not (name.startswith("Refined") and shown["refinement"] == "none") and
+                                        not (name.endswith("centres") and shown["pattern"] != "contacts"))
         for name, item in self.items.items():
             item.setVisible(self.boxes[name].isChecked() and self.boxes[name].isEnabled())
         self.legend.clear()

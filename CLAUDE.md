@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Contour extraction of contact holes in SEM images (`contour_extraction` package). It was extracted from
 `E:\PythonProjects\AffineRANSAC` (features/contact.py, features/edges.py, io/sem_image.py, pipeline.find_contacts),
-and at extraction (commit 6bb7ed8) its output was bit-identical to the original for every option. The reasons
-behind each algorithmic choice are in AffineRANSAC's `docs/SPEC.md`, stage S2: read that before changing how a step
-works.
+and at extraction (commit 6bb7ed8) its output was bit-identical to the original for every option. The contours of any
+pattern (`extract_any_contours`) were ported later from AffineRANSAC's D155 (features/contours.py,
+pipeline.find_contours), also bit-identical. The reasons behind each algorithmic choice are in AffineRANSAC's
+`docs/SPEC.md`, stage S2 (contours: its *Contours of any pattern* paragraph and decision D155): read that before
+changing how a step works.
 
 ## Commands
 Windows, Python 3.13, a venv in `.venv` (gitignored). Packaging and pytest settings are in `pyproject.toml`; the
@@ -30,6 +32,11 @@ contours) → check (contrast against a ring, optional) → refine (sub-pixel ed
 - Every step takes and returns `contacts.DetectedContacts` (centers, areas, contours, threshold, left_out). The
   step modules import only from `contacts.py`, never from each other; `pipeline.py` is the only module that combines
   them. Keep it that way.
+- `pipeline.extract_any_contours` runs the same steps, without the check, for the contours of any pattern
+  (`contacts.Contours`: points, normals, closed, region per contour): `detect.detect_contours` gives every region's
+  whole boundary (holes too), cut into open contours where it reaches the image's outermost rows and columns;
+  `refine.refine_contours` moves each point along the normal the detection gave it; `prepare.in_image_contours` maps
+  them back. It returns `(detected, refined)`. Its options are a subset of `extract_contours`' with the same defaults.
 - Upscaling: detect and refine run on the image upscaled by `upscale`. `extract_contours` therefore multiplies the
   pixel options by f and the area options by f², and maps the results back with `prepare.in_image_pixels`
   (`(xy + 0.5) / f - 0.5`, areas / f²). The contrast check runs on the image that was not upscaled, so that it
@@ -39,9 +46,10 @@ contours) → check (contrast against a ring, optional) → refine (sub-pixel ed
 - Every function and class in a step module must also be re-exported from `contour_extraction/__init__.py`, in step
   order; `tests/test_package.py` fails otherwise.
 - `viewer.py` (repo root, outside the package, which stays free of Qt): a PySide6/pyqtgraph window to try
-  `extract_contours` on real images, modelled on AffineRANSAC's `release/contour_dialog.py`. Its defaults come from
-  `extract_contours`' signature; a new pipeline option also needs an entry in its `GROUPS`, `HELP` and (numbers)
-  `LIMITS`, or `tests/test_viewer.py` fails. Its tests run Qt on the `offscreen` platform.
+  `extract_contours` on real images, modelled on AffineRANSAC's `release/contour_dialog.py`; its option `pattern`
+  (contacts | contours) runs `extract_contours` or `extract_any_contours`. Its defaults come from `extract_contours`'
+  signature; a new pipeline option also needs an entry in its `GROUPS`, `HELP` and (numbers) `LIMITS`, or
+  `tests/test_viewer.py` fails. Its tests run Qt on the `offscreen` platform.
 
 ## Tests
 One test file per step (`tests/test_<step>.py`), each importing from its submodule. `tests/synthetic.py` holds the

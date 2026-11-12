@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import pytest
 
-from contour_extraction.detect import detect_contacts
+from contour_extraction.detect import detect_contours, inside_image,detect_contacts
 from contour_extraction.load import crop_databar, load_sem_image
 from contour_extraction.prepare import flatten_background
 from synthetic import ramp_image, wide_band_image, write_sem_like
@@ -31,6 +31,28 @@ def test_contact_cut_by_image_border_is_dropped():
     cv2.circle(image, (0, 50), 10, 30, thickness=-1)  # cut by the left border
     found = detect_contacts(image, blur_sigma=0)
     np.testing.assert_allclose(found.centers, [[50, 50]], atol=1e-9)
+
+
+def test_a_boundary_loses_its_points_on_the_outermost_rows_and_columns():
+    # A region cut by the left border of a 10 x 10 image: its boundary runs along column 0 from y = 4 back to y = 2.
+    boundary = np.array([[0, 2], [1, 2], [2, 2], [3, 2], [3, 3], [3, 4], [2, 4], [1, 4], [0, 4], [0, 3]], float)
+    (piece, closed), = inside_image(np.roll(boundary, 3, axis=0), (10, 10))  # wherever the boundary starts
+    assert not closed
+    np.testing.assert_array_equal(piece, boundary[1:8])  # the edge inside the image, from one end to the other
+    (whole, closed), = inside_image(boundary + 2, (10, 10))  # off the border: the boundary itself, closed
+    assert closed
+    np.testing.assert_array_equal(whole, boundary + 2)
+
+
+def test_contours_are_every_region_cut_by_the_border_included():
+    image = np.full((100, 100), 120, dtype=np.uint8)
+    cv2.circle(image, (50, 50), 10, 30, thickness=-1)  # fully inside
+    cv2.circle(image, (0, 50), 10, 30, thickness=-1)  # cut by the left border
+    found, labels = detect_contours(image, blur_sigma=0)
+    assert list(found.closed) == [True, False] or list(found.closed) == [False, True]
+    assert labels.max() == 2 and sorted(found.region) == [1, 2]
+    cut = found.points[int(np.flatnonzero(~found.closed)[0])]
+    assert cut[:, 0].min() == 1  # column 0 is the image border, not an edge
 
 
 def test_regions_left_out_are_counted_per_reason():
