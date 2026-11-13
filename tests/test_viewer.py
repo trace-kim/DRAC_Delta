@@ -139,6 +139,29 @@ def test_the_window_shows_the_contacts_of_an_image(tmp_path, app):
     window.close()
 
 
+def test_the_contours_can_be_drawn_over_the_original_image_instead_of_the_prepared_one(tmp_path, app):
+    path = tmp_path / "tile.jpg"
+    truth = write_sem_like(path, databar_px=64)
+    window = viewer.Viewer()
+    viewer.set_value(window.editors["databar_rows"], 64)
+    viewer.set_value(window.editors["upscale"], 2)
+
+    window.open_image(str(path))
+    wait_for(lambda: window.result is not None and not window.running, app)
+    area = QtCore.QRectF(-0.5, -0.5, 1024, 704)  # the pixel frame of the image, its data bar cropped
+    covered = lambda: window.image_item.mapRectToParent(window.image_item.boundingRect())
+    assert window.displayed is window.result.prepared and covered() == area  # the default: upscaled, more pixels
+
+    window.image_buttons["original"].setChecked(True)
+    assert window.displayed is window.result.image and covered() == area  # as loaded: under the same contours
+    x, _ = window.items["Refined centres"].getData()  # the layers stay over it
+    assert len(x) == len(truth) and window.items["Refined centres"].isVisible()
+
+    window.image_buttons["prepared"].setChecked(True)
+    assert window.displayed is window.result.prepared
+    window.close()
+
+
 def test_the_window_shows_the_open_contours_of_lines_running_out_of_the_image(tmp_path, app):
     path = tmp_path / "lines.png"
     write_lines(path)

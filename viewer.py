@@ -2,8 +2,8 @@
 
     .venv\\Scripts\\python viewer.py [image]
 
-It shows the image (as loaded, or as prepared: the image the contacts are found in), the threshold mask, and the
-detected and refined contours and centres over it. Every change of an option finds the contacts again, in a background
+It shows the image (as prepared: the image the contacts are found in, or the original, as loaded), the threshold
+mask, and the detected and refined contours and centres over it. Every change of an option finds the contacts again, in a background
 thread, for the newest options only; one line says how many were found and why the other regions were left out.
 With pattern contours it finds the contours of any pattern instead (extract_any_contours): every region's outline,
 closed, or open where the region runs out of the image; the line says how many are closed and how many open.
@@ -104,8 +104,12 @@ HELP = {  # what each option does (its tooltip); as AffineRANSAC's analysis.Sett
                    "after it (smooths the pixel staircase)",
 }
 
-LAYERS = ("Prepared image", "Threshold mask", "Detected contours", "Detected centres", "Refined contours",
-          "Refined centres")
+IMAGES = {  # the image under the layers, and what it is (its tooltip)
+    "prepared": "The image the contacts are found in: flattened, denoised and upscaled as the options say",
+    "original": "The image as loaded (its data bar cropped), not flattened, denoised or upscaled: the contours over the "
+                "image itself",
+}
+LAYERS = ("Threshold mask", "Detected contours", "Detected centres", "Refined contours", "Refined centres")
 DETECTED, REFINED, THRESHOLD = "#c2189b", "#00a8c8", "#e8b500"  # the colours of AffineRANSAC's contour diagnosis
 FAILURE, MUTED = "#e34948", "#77766f"
 IMAGE_FILES = "SEM images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)"
@@ -296,7 +300,7 @@ class Viewer(QtWidgets.QMainWindow):
         mask.setLookupTable(np.array([[0, 0, 0, 0], [red, green, blue, 110]], np.uint8))
         mask.setZValue(-5)
         self.items = {"Threshold mask": mask}
-        for name in LAYERS[2:]:
+        for name in LAYERS[1:]:
             color = DETECTED if name.startswith("Detected") else REFINED
             if name.endswith("contours"):
                 self.items[name] = pg.PlotDataItem(pen=pg.mkPen(color, width=1.5), connect="finite")
@@ -307,17 +311,29 @@ class Viewer(QtWidgets.QMainWindow):
             self.plot.addItem(item)
         self.plot.scene().sigMouseMoved.connect(self._show_cursor)
 
-        self.boxes = {}
+        # Which image the layers are drawn over, and which layers are shown.
         show = QtWidgets.QHBoxLayout()
+        show.addWidget(QtWidgets.QLabel("Image:"))
+        self.image_buttons = {}
+        self.image_group = QtWidgets.QButtonGroup(self)  # one of them at a time
+        for name, help_text in IMAGES.items():
+            button = QtWidgets.QRadioButton(name)
+            button.setChecked(name == "prepared")
+            button.setToolTip(tip(help_text))
+            self.image_group.addButton(button)
+            show.addWidget(button)
+            self.image_buttons[name] = button
+        # Called for the button unticked and for the one ticked: show the image once, for the one ticked.
+        self.image_group.buttonToggled.connect(lambda _, checked: checked and self.show_image())
+        show.addSpacing(20)
         show.addWidget(QtWidgets.QLabel("Show:"))
+        self.boxes = {}
         for name in LAYERS:
             box = QtWidgets.QCheckBox(name)
             box.setChecked(name != "Threshold mask")  # the mask covers the image: off at start
-            box.toggled.connect(self.show_image if name == "Prepared image" else self.update_layers)
+            box.toggled.connect(self.update_layers)
             show.addWidget(box)
             self.boxes[name] = box
-        self.boxes["Prepared image"].setToolTip(tip("The image the contacts are found in: flattened, denoised and "
-                                                    "upscaled as the options say. Off: the image as loaded"))
         self.boxes["Threshold mask"].setToolTip(tip("The pixels the threshold takes as contact (for band: everything "
                                                     "but the bright band), before the regions are checked; pattern "
                                                     "contours: the regions whose outlines are drawn"))
@@ -464,7 +480,7 @@ class Viewer(QtWidgets.QMainWindow):
         found = self.result
         if found is None:
             self.items["Threshold mask"].clear()
-            for name in LAYERS[2:]:
+            for name in LAYERS[1:]:
                 self.items[name].setData([], [])
         else:
             self.items["Threshold mask"].setImage(found.mask, levels=(0, 1))
@@ -480,16 +496,16 @@ class Viewer(QtWidgets.QMainWindow):
         self.update_layers()
 
     def show_image(self, *_):
-        """Show the image as prepared (Prepared image ticked) or as loaded; data bar cropped once the contacts are
-        found."""
+        """Show the image as prepared or the original, as loaded (Image), under the layers; data bar cropped once the
+        contacts are found."""
         if self.loaded is None:
             return
         found = self.result
         if found is None:
             self.frame, self.displayed = self.loaded.shape, self.loaded
         else:
-            prepared = self.boxes["Prepared image"].isChecked()
-            self.frame, self.displayed = found.image.shape, found.prepared if prepared else found.image
+            original = self.image_buttons["original"].isChecked()
+            self.frame, self.displayed = found.image.shape, found.image if original else found.prepared
         self.image_item.setImage(self.displayed, levels=(0, 255))
         place(self.image_item, self.frame)
 
@@ -498,13 +514,13 @@ class Viewer(QtWidgets.QMainWindow):
         detection method or edge rule it comes from."""
         o = self.result.options if self.result else self.options()
         shown = self.options()
-        for name in LAYERS[2:]:  # refinement none: the refined ones are the detected; only contacts have centres
+        for name in LAYERS[1:]:  # refinement none: the refined ones are the detected; only contacts have centres
             self.boxes[name].setEnabled(not (name.startswith("Refined") and shown["refinement"] == "none") and
                                         not (name.endswith("centres") and shown["pattern"] != "contacts"))
         for name, item in self.items.items():
             item.setVisible(self.boxes[name].isChecked() and self.boxes[name].isEnabled())
         self.legend.clear()
-        for name in LAYERS[2:]:
+        for name in LAYERS[1:]:
             if self.items[name].isVisible():
                 self.legend.addItem(self.items[name], f"{name} ({o['detection' if 'Detected' in name else 'refinement']})")
 
