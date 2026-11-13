@@ -59,3 +59,8 @@ and `centre_errors`; the test files import it as `from synthetic import ...` (th
 ## Working rule
 The user's basic rule: implement step by step with small changes and run the tests after each step, but at a brisk
 pace: group related changes into one step, and keep the commentary between steps short.
+
+## Git
+Commit straight to `main`; never create a branch. When a task is done (tests passing), commit and push all of its
+work to `origin/main` without being asked. Why: everything is run and tried on a remote PC that only pulls `main`
+and uses it, so work that is not pushed cannot be tested there, and other branches only cause confusion.
