@@ -1,191 +1,130 @@
-"""A window to try extract_contours on real SEM images: open an image, change the options, see the contacts.
+"""A window to design a workflow that finds the contours in SEM images: open an image, put modules in a list, change
+their options, and see what each makes of the image.
 
-    .venv\\Scripts\\python viewer.py [image]
+    .venv\\Scripts\\python viewer.py [image] [workflow.json]
 
-It shows the image (as prepared: the image the contacts are found in, or the original, as loaded), the threshold
-mask, and the detected and refined contours and centres over it. Every change of an option finds the contacts again, in a background
-thread, for the newest options only; one line says how many were found and why the other regions were left out.
-With pattern contours it finds the contours of any pattern instead (extract_any_contours): every region's outline,
-closed, or open where the region runs out of the image; the line says how many are closed and how many open.
-Open an image with Open image... (Ctrl+O), by dropping its file on the window, or by naming it on the command line.
+A workflow is a list of steps, each a module of contour_extraction (modules.py) with its options: image modules
+(crop, flatten, denoise, enhance, upscale), mask modules (thresholds, Canny edges, morphology) and contours modules
+(trace, filter, refine, smooth). Add step puts a module into the list, after the step selected; the ticks turn steps
+off and on; Up and Down move them; the options of the step selected are below the list, each explained in its
+tooltip. Examples holds workflows to start from (workflow.PRESETS); Open and Save keep a workflow in a JSON file,
+which contour_extraction.load_workflow reads without this window:
 
-Not part of the contour_extraction package, which needs no Qt: a caller of it like any other. The window follows
-AffineRANSAC's contour diagnosis (release/contour_dialog.py).
+    contours = workflow_contours(load_sem_image(path), load_workflow("my workflow.json"))
+
+With Auto process ticked, every change runs the workflow again, in a background thread, for the newest steps only,
+from the first step that changed; unticked, Process (F5) does. The list says what every step found and how long it
+took. The plot shows what the last step made (View: result), or the step selected: its image, or the image as loaded,
+with its mask, its contours, the contours as they were before the step that last changed them, and the centres of
+the closed ones.
+Open an image with Open image... (Ctrl+O), by dropping its file on the window, or by naming it on the command line;
+a .json file dropped or named is a workflow.
+
+Not part of the contour_extraction package, which needs no Qt: a caller of it like any other.
 Coordinates are in the pixel frame: (x, y) = (column, row), y pointing down, pixel centres at integers.
 """
 
+import copy
 import html
-import inspect
 import sys
 import threading
-import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from contour_extraction import (DENOISERS, METHODS, REFINEMENTS, Contours, DetectedContacts, contact_mask,
-                                crop_databar, extract_any_contours, extract_contours, load_sem_image, prepared_image,
-                                upscaled_image)
+from contour_extraction import (MODULES, PRESETS, STAGES, Option, Run, State, Step, image_contours, load_sem_image,
+                                load_workflow, polygon_area, polygon_centroid, preset, run_workflow, save_workflow,
+                                step)
+from contour_extraction.modules import LEFT_OUT
 
-
-def keywords(function) -> dict:
-    """A function's options given by name only, with their defaults."""
-    return {name: p.default for name, p in inspect.signature(function).parameters.items() if p.kind is p.KEYWORD_ONLY}
-
-
-PATTERNS = ("contacts", "contours")  # what the image shows: found by extract_contours | extract_any_contours
-CONTACT_OPTIONS, CONTOUR_OPTIONS = tuple(keywords(extract_contours)), tuple(keywords(extract_any_contours))
-# The options: the pattern, the data bar to crop (load step), then every option of extract_contours with its default,
-# by step; extract_any_contours takes some of them (the same defaults).
-DEFAULTS = {"pattern": "contacts", "databar_rows": 0} | keywords(extract_contours)
-GROUPS = (("Pattern", ("pattern",)),
-          ("Load", ("databar_rows",)),
-          ("Prepare", ("background_px", "denoise", "median_px", "nlm_h", "tv_weight", "upscale")),
-          ("Detect", ("detection", "dark_contacts", "detection_blur_px", "min_area_px", "max_area_px", "min_solidity")),
-          ("Check", ("min_contrast",)),
-          ("Refine", ("refinement", "search_px", "edge_step_px", "edge_blur_px", "normal_span")))
-CHOICES = {"pattern": PATTERNS, "denoise": DENOISERS, "detection": METHODS, "refinement": REFINEMENTS}
-LIMITS = {"databar_rows": (0, 10000, 1), "background_px": (0, 2000, 5), "median_px": (3, 99, 2), "nlm_h": (0, 100, 1),
-          "tv_weight": (0, 10, 0.01), "upscale": (1, 8, 1), "detection_blur_px": (0, 50, 0.1),
-          "min_area_px": (0, 10 ** 8, 5), "max_area_px": (0, 10 ** 8, 100), "min_solidity": (0, 1, 0.01),
-          "min_contrast": (0, 100, 0.5), "search_px": (0.5, 100, 0.5), "edge_step_px": (0.01, 10, 0.05),
-          "edge_blur_px": (0, 50, 0.1), "normal_span": (1, 50, 1)}  # (minimum, maximum, step) of each number
-DENOISER_OPTIONS = {"median_px": "median", "nlm_h": "non-local means", "tv_weight": "total variation"}  # each's own
-REFINE_OPTIONS = ("search_px", "edge_step_px", "edge_blur_px", "normal_span")  # unused with refinement none
-HELP = {  # what each option does (its tooltip); as AffineRANSAC's analysis.Settings says it
-    "pattern": "What the image shows. contacts: contact holes, each a closed contour with a centre; those cut by the "
-               "image border are left out (extract_contours). contours: any pattern, the outline of every region of "
-               "the threshold mask, of any shape and direction, its holes' too: closed where the region lies inside "
-               "the image, open where it runs out of it (extract_any_contours); no centres, no solidity limit and no "
-               "contrast check",
-    "databar_rows": "Rows of the SEM data bar along the bottom of the image, cropped off before anything else; 0 = "
-                    "none. Until the contacts are found the whole image shows: the cursor's y says where the bar starts",
-    "background_px": "Flatten the background first, so that one threshold fits the whole image when its brightness "
-                     "varies (charging, shading): the brightness around the contacts (filled in over a disk this many "
-                     "pixels across, then smoothed) is subtracted. Wider than a contact, narrower than the brightness "
-                     "changes; 0 = off",
-    "denoise": "Remove pixel noise before the contacts are found (after the flattening, before the upscaling). median: "
-               "each pixel the median of a window median_px wide: removes isolated bright or dark pixels and small "
-               "spots, keeps edges. non-local means: each pixel a mean of the pixels whose surroundings look alike "
-               "(nlm_h); can wipe out contacts only a few pixels across. total variation: flat regions with sharp "
-               "edges between them (tv_weight). none: off",
-    "median_px": "Denoise median: window width in pixels (odd); removes spots narrower than half of it",
-    "nlm_h": "Denoise non-local means: strength in grey levels (OpenCV h); larger removes more noise, and more detail",
-    "tv_weight": "Denoise total variation: weight (on grey levels / 255); larger gives flatter regions and removes "
-                 "more detail",
-    "upscale": "Interpolate the image (bicubic) to this many times as many pixels per side, then find the contacts in "
-               "it: finer threshold outlines and centres for contacts only a few pixels across. The other options in "
-               "pixels stay pixels of the image as loaded. Time and memory grow with its square; 1 = off",
-    "detection": "How contacts are found (each a region with a first, pixel outline; refinement then places its "
-                 "edge). otsu: the dark regions, for images without a bright band. otsu3: the regions darker than the "
-                 "background; finds contacts whose band noise breaks up, but more false regions. band: the regions a "
-                 "bright band encloses, however grey the hole",
-    "dark_contacts": "Contacts darker than the background (holes, with a bright band); off: brighter. Contours: the "
-                     "regions outlined are the darker side; off: the brighter. Detection and edge refinement",
-    "detection_blur_px": "Detection: Gaussian blur (sigma, px) of the image before thresholding; 0 = none",
-    "min_area_px": "Detection: regions of fewer pixels (px²) are left out (noise)",
-    "max_area_px": "Detection: regions of more pixels (px²) are left out; 0 = no limit",
-    "min_solidity": "Detection, band only: regions less solid than this (area / convex hull area) are left out. "
-                    "Contacts are ~1, background pinched off between nearly touching bands 0.7-0.88; 0 = off",
-    "min_contrast": "Drop detected contacts whose mean grey level differs from a 3 px ring around them by less than "
-                    "this many noise sigma (false contacts in images without pattern); 0 = off. Noisy images give "
-                    "real contacts only a few sigma",
-    "refinement": "Edge of each contact. mid-level: where the smoothed image is half-way between the contact's "
-                  "interior and its bright band. steepest gradient: where it rises fastest (noisier). threshold: where "
-                  "it crosses the detection's threshold, one level for the whole image: for images without a bright "
-                  "band (flatten the background if the brightness varies). none: no refinement, the detected contours",
-    "search_px": "Edge refinement searches this many pixels in/out along the contour normal",
-    "edge_step_px": "Edge refinement: the image is sampled along each normal every this many pixels (<= search_px)",
-    "edge_blur_px": "Edge refinement: Gaussian blur (sigma, px) of the image the edges are found on; 0 = none",
-    "normal_span": "Edge refinement: each contour point's normal runs across the contour points this many before and "
-                   "after it (smooths the pixel staircase)",
+START = "Contact holes"  # the workflow (of PRESETS) the window opens with
+VIEWS = {  # what the plot shows, and what that is (its tooltip)
+    "result": "What the whole workflow made: the state after its last step (that ran)",
+    "selected step": "What the workflow had made after the step selected in the list: to see what each step does",
 }
-
 IMAGES = {  # the image under the layers, and what it is (its tooltip)
-    "prepared": "The image the contacts are found in: flattened, denoised and upscaled as the options say",
-    "original": "The image as loaded (its data bar cropped), not flattened, denoised or upscaled: the contours over the "
-                "image itself",
+    "processed": "The image as the image modules made it, up to the step shown: what the pattern is found in",
+    "original": "The image as loaded: the contours over the image itself",
 }
-LAYERS = ("Threshold mask", "Detected contours", "Detected centres", "Refined contours", "Refined centres")
-DETECTED, REFINED, THRESHOLD = "#c2189b", "#00a8c8", "#e8b500"  # the colours of AffineRANSAC's contour diagnosis
+LAYERS = {  # the layers over the image, and what each is (its tooltip)
+    "Mask": "The mask as it is at the step shown: the regions a threshold took, or Canny's edge pixels",
+    "Contours": "The contours as they are at the step shown",
+    "Contours before": "The contours as they were before the step that last changed them (the pixel outline before "
+                       "Refine edges, all of them before Filter contours)",
+    "Centres": "The area centroid of every closed contour",
+}
+BEFORE, AFTER, MASK = "#c2189b", "#00a8c8", "#e8b500"  # the colours of AffineRANSAC's contour diagnosis
 FAILURE, MUTED = "#e34948", "#77766f"
 IMAGE_FILES = "SEM images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)"
-NO_IMAGE = ("Open an SEM image (<i>Open image...</i>, Ctrl+O, or drop its file on the window) to see the contacts "
-            "extract_contours finds in it (pattern contours: the contours of any pattern). Hover an option to see "
-            "what it does.")
+WORKFLOW_FILES = "Workflows (*.json);;All files (*)"
+NO_IMAGE = ("Open an SEM image (<i>Open image...</i>, Ctrl+O, or drop its file on the window) to see the contours "
+            "the workflow on the right finds in it. Hover a step, an option or a menu entry to see what it does.")
 
 
-@dataclass
-class Found:
-    """The contacts (or contours) of one image with one set of options, and the images to show them on."""
-    options: dict               # the options they were found with
-    image: np.ndarray           # the image as loaded, its data bar cropped: the pixel frame of everything below
-    prepared: np.ndarray        # the image the contacts are found in (prepared_image), upscaled: more pixels, same area
-    mask: np.ndarray            # uint8, the pixels of `prepared`: 1 = taken as contact by the threshold
-    detected: DetectedContacts | Contours  # contacts: after the contrast check; pattern contours: Contours
-    refined: DetectedContacts | Contours   # refinement none: the detected ones
-    dropped: int                # detected contacts the contrast check dropped (contours: none)
-    seconds: float              # time extract_contours took (with the preparation)
+def step_title(steps: list[Step], row: int) -> str:
+    """A step as the list names it: its number (from 1) and its module."""
+    name = steps[row].module
+    return f"{row + 1}. {MODULES[name].title if name in MODULES else name}"
 
 
-def find(loaded: np.ndarray, options: dict) -> Found:
-    """The contacts extract_contours finds in the loaded image with these options (databar_rows: cropped off first;
-    pattern contours: the contours extract_any_contours finds), and the prepared image and threshold mask to show
-    them on."""
-    options = dict(options)
-    image = crop_databar(loaded, options.pop("databar_rows"))
-    start = time.perf_counter()
-    # Prepared here, to show it; extract_contours, given it with background_px 0 and denoise none, uses it as it is.
-    flat = prepared_image(image, options["background_px"], options["dark_contacts"], options["denoise"],
-                          options["median_px"], options["nlm_h"], options["tv_weight"])
-    given = options | {"background_px": 0.0, "denoise": "none"}
-    if options["pattern"] == "contours":
-        detected, refined = extract_any_contours(flat, **{name: given[name] for name in CONTOUR_OPTIONS})
-        dropped = 0
+def place_for(steps: list[Step], module: str, wanted: int) -> int:
+    """The row to put a new step of this module at: `wanted`, or the nearest row that keeps the image modules before
+    the mask modules before the contours modules (a blur added while the last step is selected goes before the
+    threshold, not after the contours). A list that is not in that order already: `wanted`, as it is."""
+    stages = [STAGES.index(MODULES[s.module].stage) for s in steps]
+    if stages != sorted(stages):
+        return wanted
+    stage = STAGES.index(MODULES[module].stage)
+    first = sum(1 for other in stages if other < stage)  # after every step of an earlier stage
+    last = sum(1 for other in stages if other <= stage)  # before every step of a later one
+    return min(max(wanted, first), last)
+
+
+def alike(steps: list[Step], run: Run | None) -> int:
+    """How many steps, from the first, are those the run ran: its states after them are still theirs."""
+    count = 0
+    if run is not None:
+        while count < min(len(steps), len(run.states) - 1) and steps[count] == run.steps[count]:
+            count += 1
+    return count
+
+
+def made_by(run: Run, viewed: int) -> int | None:
+    """The step (from 1) that made the contours of run.states[viewed] what they are; None: there are none."""
+    contours = run.states[viewed].contours
+    if contours is None:
+        return None
+    return next(k for k in range(viewed + 1) if run.states[k].contours is contours)
+
+
+def summary(run: Run, viewed: int) -> str:
+    """What the workflow found, as far as run.states[viewed], in words (HTML): how many contours, how large the
+    closed ones are, which regions were left out and why, and how long it all took; a step that failed first."""
+    state = run.states[viewed]
+    where = "in the image as loaded" if viewed == 0 else \
+        f"after step {viewed} ({html.escape(MODULES[run.steps[viewed - 1].module].title)})"
+    contours = image_contours(state)
+    if contours is None:
+        rows, cols = state.image.shape
+        text = f"<b>No contours</b> {where}: an image of {cols} × {rows} px"
+        if state.mask is not None:
+            text += f", {100 * float(state.mask.mean()):.0f} % of it mask"
     else:
-        detected, refined, dropped = extract_contours(flat, **{name: given[name] for name in CONTACT_OPTIONS})
-    seconds = time.perf_counter() - start
-    f = options["upscale"]
-    prepared = upscaled_image(flat, f)  # as extract_contours upscales it, its blur in pixels of the image as given
-    mask, _ = contact_mask(prepared, options["dark_contacts"], options["detection_blur_px"] * f, options["detection"])
-    return Found(options, image, prepared, mask, detected, refined, dropped, seconds)
-
-
-def summary(found: Found) -> str:
-    """How many contacts were found, how large, and why the other regions were left out, in words (HTML); pattern
-    contours: how many contours, how many closed and open."""
-    o = found.options
-    reasons = {"border": "touching the image border", "small": f"smaller than {o['min_area_px']} px²",
-               "large": f"larger than {o['max_area_px']} px²", "not solid": f"less solid than {o['min_solidity']:g}"}
-    left_out = [f"{count} {reasons.get(why, why)}" for why, count in found.detected.left_out.items() if count]
-    if found.dropped:
-        left_out.append(f"{found.dropped} below the contrast of {o['min_contrast']:g} noise σ")
-    if isinstance(found.refined, Contours):
-        closed = found.refined.closed
-        text = (f"<b>{len(closed)} contours</b>: {int(closed.sum())} closed, {int((~closed).sum())} open (ending at "
-                f"the image border)")
-    else:
-        areas = found.refined.areas
-        text = f"<b>{len(areas)} contacts</b>"
-        if len(areas):
+        areas = [polygon_area(points) for points, closed in zip(contours.points, contours.closed) if closed]
+        text = f"<b>{len(contours.points)} contours</b> {where}: {len(areas)} closed"
+        if areas:
             median = float(np.median(areas))
-            text += f", median area {median:.1f} px² (diameter {2 * np.sqrt(median / np.pi):.2f} px)"
-    text += (f"; {o['detection']} threshold at grey level {found.detected.threshold:.0f}{of_the_image(o)}; "
-             f"{found.seconds:.2f} s. ")
-    return text + (f"Left out: {', '.join(left_out)}." if left_out else "")
-
-
-def of_the_image(options: dict) -> str:
-    """What was done to the image before the threshold, in words ("" if nothing)."""
-    steps = [step for step, done in (("flattened", options["background_px"] > 0),
-                                     (f"denoised ({options['denoise']})", options["denoise"] != "none"),
-                                     (f"upscaled {options['upscale']}×", options["upscale"] > 1)) if done]
-    if len(steps) > 1:
-        steps = [", ".join(steps[:-1]) + " and " + steps[-1]]
-    return f" of the image {steps[0]}" if steps else ""
+            text += f" (median area {median:.1f} px², diameter {2 * np.sqrt(median / np.pi):.2f} px)"
+        text += f", {len(contours.points) - len(areas)} open"
+        left_out = [f"{count} {LEFT_OUT.get(why, why)}" for why, count in contours.left_out.items() if count]
+        if left_out:
+            text += f"; left out: {', '.join(left_out)}"
+    text += f"; {sum(run.seconds):.2f} s."
+    if run.error is not None:
+        text = f"<span style='color:{FAILURE}'>{html.escape(run.failure)}.</span> Shown: {text}"
+    return text
 
 
 def outlines(contours: list[np.ndarray], closed: np.ndarray | None = None) -> np.ndarray:
@@ -199,32 +138,20 @@ def outlines(contours: list[np.ndarray], closed: np.ndarray | None = None) -> np
     return np.concatenate(parts) if parts else np.empty((0, 2))
 
 
-def applies(name: str, options: dict) -> bool:
-    """Whether an option changes anything, given the others: for pattern contours only extract_any_contours' options,
-    min_solidity for band only, each denoiser's option for that denoiser only, the refinement's options unless
-    refinement is none."""
-    if options["pattern"] == "contours" and name in CONTACT_OPTIONS and name not in CONTOUR_OPTIONS:
-        return False
-    if name == "min_solidity":
-        return options["detection"] == "band"
-    if name in DENOISER_OPTIONS:
-        return options["denoise"] == DENOISER_OPTIONS[name]
-    return name not in REFINE_OPTIONS or options["refinement"] != "none"
-
-
-def editor(name: str, value) -> QtWidgets.QWidget:
-    """A widget to edit an option: a list of its choices, a check box (bool) or a spin box (int or float)."""
-    if name in CHOICES:
+def editor(option: Option) -> QtWidgets.QWidget:
+    """A widget to edit an option, showing its default: a list of its choices, a check box (bool) or a spin box (int
+    or float) that tells its value when the typing is done."""
+    if option.choices:
         widget = QtWidgets.QComboBox()
-        widget.addItems(CHOICES[name])
-    elif isinstance(value, bool):  # before int: a bool is an int
+        widget.addItems(option.choices)
+    elif isinstance(option.default, bool):  # before int: a bool is an int
         widget = QtWidgets.QCheckBox()
     else:
-        widget = QtWidgets.QSpinBox() if isinstance(value, int) else QtWidgets.QDoubleSpinBox(decimals=3)
-        low, high, step = LIMITS[name]
-        widget.setRange(low, high)
-        widget.setSingleStep(step)
-    set_value(widget, value)
+        widget = QtWidgets.QSpinBox() if isinstance(option.default, int) else QtWidgets.QDoubleSpinBox(decimals=3)
+        widget.setRange(option.low, option.high)
+        widget.setSingleStep(option.step)
+        widget.setKeyboardTracking(False)  # 12 typed is 12, not 1 and then 12
+    set_value(widget, option.default)
     return widget
 
 
@@ -267,25 +194,38 @@ def dropped_file(mime: QtCore.QMimeData) -> str | None:
     return files[0] if files else None
 
 
+def tip(text: str) -> str:
+    """A tooltip that wraps its lines (Qt wraps rich text only)."""
+    return f"<p>{html.escape(text)}</p>"
+
+
 class Viewer(QtWidgets.QMainWindow):
-    searched = QtCore.Signal(int, object)  # (search number, Found or the exception), from the background thread
+    processed = QtCore.Signal(int, int, object)  # (request, version of the steps, the Run), from the background thread
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Contour extraction")
         self.setAcceptDrops(True)
-        self.loaded = None     # the image as loaded (uint8), data bar included
-        self.result = None     # Found: what is shown (None: the loaded image alone)
-        self.displayed = None  # the image shown, and the shape of the image whose pixel frame it covers
+        self.loaded = None        # the image as loaded (uint8), data bar included
+        self.image_name = ""
+        self.steps = []           # the workflow: list[Step], changed in place by the list and the options
+        self.workflow_name = ""   # of the example or the file it came from
+        self.modified = False     # changed since
+        self.version = 0          # counts the changes of the steps
+        self.result = None        # Run: the newest finished run of the image loaded (None: none yet)
+        self.result_version = -1  # the version of the steps it ran
+        self.displayed = None     # the image shown, and the shape of the image whose pixel frame it covers
         self.frame = None
-        self.folder = ""       # where Open image starts
-        self.request = 0       # number of the newest search asked for
-        self.running = False   # a search runs in the background thread
-        self.searched.connect(self._searched)
-        self.timer = QtCore.QTimer(self, singleShot=True, interval=150)  # a search once the typing pauses
-        self.timer.timeout.connect(self.search)
+        self.image_folder = ""    # where Open image starts
+        self.workflow_folder = ""  # where Open and Save (workflow) start
+        self.request = 0          # number of the newest run asked for
+        self.running = False      # a run is in the background thread
+        self.filling = False      # the list is being filled: its ticks are not the user's
+        self.editors = {}         # the editors of the step selected, by option
+        self.processed.connect(self._processed)
+        self.timer = QtCore.QTimer(self, singleShot=True, interval=150)  # a run once the changes pause
+        self.timer.timeout.connect(self.process)
 
-        # The plot: the image, the threshold mask over it, the contours and centres on top.
+        # The plot: the image, the mask over it, the contours and centres on top.
         self.plot = pg.PlotWidget()
         self.plot.invertY(True)  # image rows run down
         self.plot.setAspectLocked(True)
@@ -296,75 +236,34 @@ class Viewer(QtWidgets.QMainWindow):
         self.image_item.setZValue(-10)
         self.plot.addItem(self.image_item)
         mask = pg.ImageItem(axisOrder="row-major")
-        red, green, blue, _ = pg.mkColor(THRESHOLD).getRgb()
+        red, green, blue, _ = pg.mkColor(MASK).getRgb()
         mask.setLookupTable(np.array([[0, 0, 0, 0], [red, green, blue, 110]], np.uint8))
         mask.setZValue(-5)
-        self.items = {"Threshold mask": mask}
-        for name in LAYERS[1:]:
-            color = DETECTED if name.startswith("Detected") else REFINED
-            if name.endswith("contours"):
-                self.items[name] = pg.PlotDataItem(pen=pg.mkPen(color, width=1.5), connect="finite")
-            else:
-                self.items[name] = pg.PlotDataItem(pen=None, symbol="+", symbolSize=9,
-                                                   symbolPen=pg.mkPen(color, width=1.5))
+        self.items = {"Mask": mask,
+                      "Contours before": pg.PlotDataItem(pen=pg.mkPen(BEFORE, width=1.5), connect="finite"),
+                      "Contours": pg.PlotDataItem(pen=pg.mkPen(AFTER, width=1.5), connect="finite"),
+                      "Centres": pg.PlotDataItem(pen=None, symbol="+", symbolSize=9, symbolPen=pg.mkPen(AFTER, width=1.5))}
         for item in self.items.values():
             self.plot.addItem(item)
+        self.legend_names = {}  # of the contour layers, by layer
         self.plot.scene().sigMouseMoved.connect(self._show_cursor)
 
-        # Which image the layers are drawn over, and which layers are shown.
+        # What the plot shows: of which step, over which image, which layers.
         show = QtWidgets.QHBoxLayout()
-        show.addWidget(QtWidgets.QLabel("Image:"))
-        self.image_buttons = {}
-        self.image_group = QtWidgets.QButtonGroup(self)  # one of them at a time
-        for name, help_text in IMAGES.items():
-            button = QtWidgets.QRadioButton(name)
-            button.setChecked(name == "prepared")
-            button.setToolTip(tip(help_text))
-            self.image_group.addButton(button)
-            show.addWidget(button)
-            self.image_buttons[name] = button
-        # Called for the button unticked and for the one ticked: show the image once, for the one ticked.
-        self.image_group.buttonToggled.connect(lambda _, checked: checked and self.show_image())
+        self.view_buttons = self._radio_buttons(show, "View:", VIEWS)
+        show.addSpacing(20)
+        self.image_buttons = self._radio_buttons(show, "Image:", IMAGES)
         show.addSpacing(20)
         show.addWidget(QtWidgets.QLabel("Show:"))
         self.boxes = {}
-        for name in LAYERS:
+        for name, help_text in LAYERS.items():
             box = QtWidgets.QCheckBox(name)
-            box.setChecked(name != "Threshold mask")  # the mask covers the image: off at start
+            box.setChecked(name != "Mask")  # the mask covers the image: off at start
+            box.setToolTip(tip(help_text))
             box.toggled.connect(self.update_layers)
             show.addWidget(box)
             self.boxes[name] = box
-        self.boxes["Threshold mask"].setToolTip(tip("The pixels the threshold takes as contact (for band: everything "
-                                                    "but the bright band), before the regions are checked; pattern "
-                                                    "contours: the regions whose outlines are drawn"))
         show.addStretch(1)
-
-        # The options, by step; what each does in its tooltip.
-        self.editors = {}
-        panel = QtWidgets.QVBoxLayout()
-        for title, names in GROUPS:
-            group = QtWidgets.QGroupBox(title)
-            form = QtWidgets.QFormLayout(group)
-            for name in names:
-                widget = editor(name, DEFAULTS[name])
-                label = QtWidgets.QLabel(name)
-                for item in (label, widget):
-                    item.setToolTip(tip(HELP[name]))
-                form.addRow(label, widget)
-                changed_signal(widget).connect(self.changed)
-                self.editors[name] = widget
-            panel.addWidget(group)
-        defaults = QtWidgets.QPushButton("Defaults")
-        defaults.setToolTip("Set every option back to extract_contours' default (and databar_rows to 0)")
-        defaults.clicked.connect(self.reset)
-        panel.addWidget(defaults)
-        panel.addStretch(1)
-        side = QtWidgets.QWidget()
-        side.setLayout(panel)
-        scroll = QtWidgets.QScrollArea(widgetResizable=True)
-        scroll.setWidget(side)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # as wide as the options
-        scroll.setFixedWidth(side.sizeHint().width() + scroll.verticalScrollBar().sizeHint().width() + 4)
 
         open_button = QtWidgets.QPushButton("Open image...")
         open_button.setShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Open))
@@ -381,148 +280,508 @@ class Viewer(QtWidgets.QMainWindow):
         status = QtWidgets.QHBoxLayout()
         status.addWidget(self.summary, stretch=1)
         status.addWidget(self.busy)
-        middle = QtWidgets.QHBoxLayout()
-        middle.addWidget(self.plot, stretch=1)
-        middle.addWidget(scroll)
-        central = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(central)
+        left = QtWidgets.QWidget()
+        column = QtWidgets.QVBoxLayout(left)
+        column.setContentsMargins(0, 0, 0, 0)
         for row in (top, status, show):
-            layout.addLayout(row)
-        layout.addLayout(middle, stretch=1)
-        self.setCentralWidget(central)
+            column.addLayout(row)
+        column.addWidget(self.plot, stretch=1)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.addWidget(left)
+        splitter.addWidget(self._workflow_panel())
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([1040, 440])
+        self.setCentralWidget(splitter)
         self.statusBar()  # the cursor's position and grey level
+        self.set_workflow(preset(START), START)
+        self.resize(1500, 900)
+
+    def _radio_buttons(self, layout, label: str, choices: dict) -> dict:
+        """Radio buttons for one of the choices (the first at start), each with its tooltip; any change shows the
+        result again."""
+        layout.addWidget(QtWidgets.QLabel(label))
+        group = QtWidgets.QButtonGroup(self)  # one of them at a time
+        buttons = {}
+        for name, help_text in choices.items():
+            button = QtWidgets.QRadioButton(name)
+            button.setChecked(not buttons)
+            button.setToolTip(tip(help_text))
+            group.addButton(button)
+            layout.addWidget(button)
+            buttons[name] = button
+        # Called for the button unticked and for the one ticked: show once, for the one ticked.
+        group.buttonToggled.connect(lambda _, checked: checked and self.show_result())
+        return buttons
+
+    def _workflow_panel(self) -> QtWidgets.QWidget:
+        """The right side: the workflow's name and files, its steps, the options of the step selected, and when it
+        runs."""
+        self.workflow_label = QtWidgets.QLabel("")
+        examples = QtWidgets.QPushButton("Examples")
+        examples.setToolTip("Workflows to start from, for different kinds of SEM image")
+        menu = QtWidgets.QMenu(examples)
+        menu.setToolTipsVisible(True)
+        for name, (description, _) in PRESETS.items():
+            action = menu.addAction(name)
+            action.setToolTip(tip(description))
+            action.triggered.connect(lambda _=False, name=name: self.choose_preset(name))
+        examples.setMenu(menu)
+        self.examples_menu = menu
+        open_button = QtWidgets.QPushButton("Open...")
+        open_button.setToolTip("Open a workflow saved in a file; or drop the file on the window")
+        open_button.clicked.connect(self.choose_workflow)
+        save_button = QtWidgets.QPushButton("Save...")
+        save_button.setShortcut(QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Save))
+        save_button.setToolTip("Save the workflow in a file (Ctrl+S), to open it here another day, or to run it "
+                               "without this window (contour_extraction.load_workflow)")
+        save_button.clicked.connect(self.choose_save)
+        files = QtWidgets.QHBoxLayout()
+        files.addWidget(self.workflow_label, stretch=1)
+        for button in (examples, open_button, save_button):
+            files.addWidget(button)
+
+        self.list = QtWidgets.QTreeWidget()
+        self.list.setHeaderLabels(["Step", "Result", "Time"])
+        self.list.setRootIsDecorated(False)
+        self.list.setUniformRowHeights(True)
+        self.list.setTextElideMode(QtCore.Qt.TextElideMode.ElideRight)
+        header = self.list.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.list.itemChanged.connect(self._ticked)
+        self.list.currentItemChanged.connect(self._selected)
+
+        add = QtWidgets.QPushButton("Add step")
+        add.setToolTip(tip("Put a module into the workflow: after the step selected, or at the nearest place where a "
+                           "module of its kind belongs (image modules before the mask is made, mask modules before the "
+                           "contours are traced). Up and Down move it anywhere"))
+        menu = QtWidgets.QMenu(add)
+        for stage in STAGES:
+            stage_menu = menu.addMenu(stage)
+            stage_menu.setToolTipsVisible(True)
+            for module in MODULES.values():
+                if module.stage == stage:
+                    action = stage_menu.addAction(module.title)
+                    action.setToolTip(tip(module.help))
+                    action.triggered.connect(lambda _=False, name=module.name: self.add_step(name))
+        add.setMenu(menu)
+        self.add_menu = menu  # a menu per stage, in it an entry per module
+        self.step_buttons = {}
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addWidget(add)
+        for name, shortcut, slot, help_text in (
+                ("Remove", "Ctrl+Del", self.remove_step, "Take the step selected out of the workflow"),
+                ("Up", "Alt+Up", lambda: self.move_step(-1), "Run the step selected one step earlier"),
+                ("Down", "Alt+Down", lambda: self.move_step(1), "Run the step selected one step later")):
+            button = QtWidgets.QPushButton(name)
+            button.setShortcut(QtGui.QKeySequence(shortcut))
+            button.setToolTip(f"{help_text} ({shortcut})")
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+            self.step_buttons[name] = button
+
+        self.options_area = QtWidgets.QScrollArea(widgetResizable=True)
+        self.options_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.auto = QtWidgets.QCheckBox("Auto process")
+        self.auto.setChecked(True)
+        self.auto.setToolTip(tip("Run the workflow again after every change: of an option, of the steps, of the image. "
+                                 "Unticked (a slow workflow, several changes at once): Process runs it"))
+        self.auto.toggled.connect(self._auto_toggled)
+        self.process_button = QtWidgets.QPushButton("Process")
+        self.process_button.setShortcut(QtGui.QKeySequence("F5"))
+        self.process_button.setToolTip("Run the workflow on the image now (F5)")
+        self.process_button.clicked.connect(self.process)
+        when = QtWidgets.QHBoxLayout()
+        when.addWidget(self.auto)
+        when.addStretch(1)
+        when.addWidget(self.process_button)
+
+        panel = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(6, 0, 0, 0)
+        layout.addLayout(files)
+        layout.addWidget(self.list, stretch=2)
+        layout.addLayout(buttons)
+        layout.addWidget(self.options_area, stretch=3)
+        layout.addLayout(when)
+        panel.setMinimumWidth(380)
+        return panel
+
+    # --- The workflow: its steps and their options --------------------------------------------------------------------
+
+    def selected(self) -> int | None:
+        """The row of the step selected (None: none)."""
+        row = self.list.indexOfTopLevelItem(self.list.currentItem())
+        return row if row >= 0 else None
+
+    def set_workflow(self, steps: list[Step], name: str = ""):
+        """Replace the workflow by these steps (its name: of the example or file they are from), and run it."""
+        self.steps, self.workflow_name = copy.deepcopy(list(steps)), name
+        self.fill_list(len(self.steps) - 1)
         self.changed()
-        self.resize(1400, 900)
+        self.modified = False
+        self.update_names()
 
-    def options(self) -> dict:
-        """The options shown."""
-        return {name: value(widget) for name, widget in self.editors.items()}
+    def fill_list(self, select: int | None):
+        """Show the steps in the list, and select one of them."""
+        self.filling = True
+        self.list.clear()
+        for row, this in enumerate(self.steps):
+            item = QtWidgets.QTreeWidgetItem([step_title(self.steps, row), "", ""])
+            item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable
+                          | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, QtCore.Qt.CheckState.Checked if this.enabled else QtCore.Qt.CheckState.Unchecked)
+            item.setTextAlignment(2, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            self.list.addTopLevelItem(item)
+        self.filling = False
+        if select is not None and self.steps:
+            self.list.setCurrentItem(self.list.topLevelItem(max(0, min(select, len(self.steps) - 1))))
+        else:
+            self._selected()
 
-    def changed(self, *_):
-        """An option changed: grey out the options that change nothing now, then search again once the typing
-        pauses."""
-        o = self.options()
-        for name, widget in self.editors.items():
-            widget.setEnabled(applies(name, o))
-        self.update_layers()
-        self.timer.start()
-
-    def reset(self):
-        """Every option back to its default; one search."""
-        for name, widget in self.editors.items():
-            widget.blockSignals(True)
-            set_value(widget, DEFAULTS[name])
-            widget.blockSignals(False)
+    def add_step(self, module: str):
+        """Put a step of this module, with its defaults, after the step selected (none: at the end), or at the
+        nearest row where a module of its stage belongs (place_for)."""
+        row = place_for(self.steps, module, len(self.steps) if self.selected() is None else self.selected() + 1)
+        self.steps.insert(row, step(module))
+        self.fill_list(row)
         self.changed()
+
+    def remove_step(self):
+        row = self.selected()
+        if row is not None:
+            del self.steps[row]
+            self.fill_list(row)
+            self.changed()
+
+    def move_step(self, by: int):
+        """Move the step selected up (-1) or down (1) the list."""
+        row = self.selected()
+        if row is not None and 0 <= row + by < len(self.steps):
+            self.steps.insert(row + by, self.steps.pop(row))
+            self.fill_list(row + by)
+            self.changed()
+
+    def _ticked(self, item, column):
+        """A step ticked or unticked: on or off."""
+        row = self.list.indexOfTopLevelItem(item)
+        enabled = item.checkState(0) == QtCore.Qt.CheckState.Checked
+        if not self.filling and column == 0 and self.steps[row].enabled != enabled:
+            self.steps[row].enabled = enabled
+            self.changed()
+
+    def _selected(self, *_):
+        """Another step is selected: show its options, and what it made if that is what the plot shows."""
+        if self.filling:
+            return
+        row = self.selected()
+        for name, button in self.step_buttons.items():
+            button.setEnabled(row is not None and (name == "Remove" or 0 <= row + (-1 if name == "Up" else 1) < len(self.steps)))
+        self.show_options()
+        if self.view_buttons["selected step"].isChecked():
+            self.show_result()
+
+    def show_options(self):
+        """The options of the step selected, each with its tooltip, under what its module does."""
+        row = self.selected()
+        box = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(box)
+        self.editors = {}
+        if row is None:
+            text = QtWidgets.QLabel("Add a step, or choose a workflow to start from under Examples.", wordWrap=True)
+            text.setStyleSheet(f"color: {MUTED}")
+            layout.addWidget(text)
+        else:
+            this, module = self.steps[row], MODULES[self.steps[row].module]
+            layout.addWidget(QtWidgets.QLabel(f"<b>{html.escape(step_title(self.steps, row))}</b> "
+                                              f"<span style='color:{MUTED}'>({module.stage.lower()} module)</span>"))
+            layout.addWidget(QtWidgets.QLabel(module.help, wordWrap=True, textFormat=QtCore.Qt.TextFormat.PlainText))
+            form = QtWidgets.QFormLayout()
+            for name, option in module.options.items():
+                widget = editor(option)
+                set_value(widget, this.options[name])
+                label = QtWidgets.QLabel(name)
+                for item in (label, widget):
+                    item.setToolTip(tip(option.help))
+                form.addRow(label, widget)
+                changed_signal(widget).connect(lambda new, name=name, this=this: self._edited(this, name, new))
+                self.editors[name] = widget
+            layout.addLayout(form)
+            if module.options:
+                self.defaults_button = QtWidgets.QPushButton("Defaults")
+                self.defaults_button.setToolTip("Set the options of this step back to the module's defaults")
+                self.defaults_button.clicked.connect(self.reset_step)
+                layout.addWidget(self.defaults_button, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+        layout.addStretch(1)
+        self.options_area.setWidget(box)  # deletes the one before
+
+    def _edited(self, this: Step, name: str, new):
+        """An option of a step was changed in its editor."""
+        if this.options[name] != new:
+            this.options[name] = new
+            self.changed()
+
+    def reset_step(self, *_):
+        """The options of the step selected back to its module's defaults; one run."""
+        row = self.selected()
+        if row is not None and self.steps[row].options != step(self.steps[row].module).options:
+            self.steps[row].options = step(self.steps[row].module).options
+            for name, widget in self.editors.items():  # shown without each editor reporting a change of its own
+                widget.blockSignals(True)
+                set_value(widget, self.steps[row].options[name])
+                widget.blockSignals(False)
+            self.changed()
+
+    def changed(self):
+        """The workflow changed: run it again once the changes pause (Auto process), or say that it waits for
+        Process."""
+        self.version += 1
+        self.modified = True
+        self.update_names()
+        self.update_list()
+        if self.auto.isChecked():
+            self.timer.start()
+        self.update_waiting()
+
+    def waiting(self) -> bool:
+        """Whether what is shown is not what the workflow, as it is now, makes of the image loaded."""
+        return self.loaded is not None and (self.result is None or self.result_version != self.version)
+
+    def update_waiting(self):
+        """Say whether a run is on its way, or waits for Process."""
+        waits = self.waiting() and not self.running and not self.timer.isActive()
+        self.busy.setText("Processing..." if self.running or self.timer.isActive() and self.loaded is not None
+                          else "Changed: press Process (F5)" if waits else "")
+        self.process_button.setStyleSheet("font-weight: bold" if waits else "")
+
+    def _auto_toggled(self, on: bool):
+        """Ticked: run what waits. Unticked: a run that waited for the changes to pause waits for Process instead."""
+        if on and self.waiting():
+            self.process()
+        elif not on:
+            self.timer.stop()
+        self.update_waiting()
+
+    def update_names(self):
+        """The names of the image and of the workflow, in the window's title and over the list."""
+        name = (self.workflow_name or "Workflow") + (" (changed)" if self.modified else "")
+        self.workflow_label.setText(f"<b>{html.escape(name)}</b>")
+        self.setWindowTitle(" - ".join(part for part in (self.image_name, name, "Contour extraction") if part))
+
+    def update_list(self):
+        """Beside every step, what it found and how long it took, as far as the newest run ran these steps; the step
+        that failed in red, with the reason."""
+        run = self.result
+        same = alike(self.steps, run)
+        self.filling = True
+        for row, this in enumerate(self.steps):
+            item = self.list.topLevelItem(row)
+            failed = run is not None and run.error is not None and row == same == len(run.states) - 1 \
+                and row < len(run.steps) and run.steps[row] == this
+            if failed:
+                note, seconds = run.failure.split(": ", 1)[1], ""
+            elif row < same:
+                note, seconds = run.states[row + 1].note, f"{run.seconds[row]:.2f} s"
+            else:
+                note, seconds = "", ""
+            item.setText(1, note)
+            item.setText(2, seconds)
+            module = MODULES.get(this.module)
+            options = ", ".join(f"{name} = {value}" for name, value in this.options.items())
+            item.setToolTip(0, tip(f"{module.help if module else ''} {'Options: ' + options if options else ''}"))
+            item.setToolTip(1, tip(note) if note else "")
+            colour = QtGui.QBrush(QtGui.QColor(FAILURE if failed else MUTED)) if failed or not this.enabled \
+                else QtGui.QBrush()
+            for column in range(3):
+                item.setForeground(column, colour)
+        self.filling = False
+
+    # --- Workflow files -----------------------------------------------------------------------------------------------
+
+    def may_replace(self) -> bool:
+        """Whether the workflow may be replaced: it has no changes, or the user says so."""
+        if not self.modified or not self.steps:
+            return True
+        answer = QtWidgets.QMessageBox.question(self, "Contour extraction",
+                                                "Replace the workflow? Its changes are not saved.")
+        return answer == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def choose_preset(self, name: str):
+        if self.may_replace():
+            self.set_workflow(preset(name), name)
+
+    def choose_workflow(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open a workflow", self.workflow_folder, WORKFLOW_FILES)
+        if path and self.may_replace():
+            self.open_workflow(path)
+
+    def open_workflow(self, path: str) -> bool:
+        """Replace the workflow by the one of a file; False (and a message) if the file is none."""
+        try:
+            steps = load_workflow(path)
+        except (OSError, ValueError) as error:
+            QtWidgets.QMessageBox.warning(self, "Contour extraction", f"The workflow could not be read:\n{error}")
+            return False
+        self.workflow_folder = str(Path(path).parent)
+        self.set_workflow(steps, Path(path).stem)
+        return True
+
+    def choose_save(self):
+        start = str(Path(self.workflow_folder) / f"{self.workflow_name or 'workflow'}.json")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save the workflow", start, WORKFLOW_FILES)
+        if path:
+            self.save_workflow(path)
+
+    def save_workflow(self, path: str) -> bool:
+        try:
+            save_workflow(path, self.steps)
+        except OSError as error:
+            QtWidgets.QMessageBox.warning(self, "Contour extraction", f"The workflow could not be saved:\n{error}")
+            return False
+        self.workflow_folder, self.workflow_name, self.modified = str(Path(path).parent), Path(path).stem, False
+        self.update_names()
+        return True
+
+    # --- The image, and running the workflow on it --------------------------------------------------------------------
 
     def choose_image(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open an SEM image", self.folder, IMAGE_FILES)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open an SEM image", self.image_folder, IMAGE_FILES)
         if path:
             self.open_image(path)
 
     def open_image(self, path: str):
-        """Show the image, whole, and find its contacts."""
+        """Show the image, whole, and run the workflow on it (Auto process; else it waits for Process)."""
         try:
             loaded = load_sem_image(path)
         except (OSError, ValueError) as error:
             QtWidgets.QMessageBox.warning(self, "Contour extraction", f"The image could not be read:\n{error}")
             return
-        self.loaded, self.result, self.folder = loaded, None, str(Path(path).parent)
-        self.name_label.setText(f"{Path(path).name}   ({loaded.shape[1]} × {loaded.shape[0]} px)")
-        self.setWindowTitle(f"{Path(path).name} - Contour extraction")
+        self.loaded, self.result, self.image_folder = loaded, None, str(Path(path).parent)
+        self.image_name = Path(path).name
+        self.name_label.setText(f"{self.image_name}   ({loaded.shape[1]} × {loaded.shape[0]} px)")
+        self.update_names()
         self.summary.setText("")
+        self.update_list()
         self.show_result()
         self.plot.setRange(xRange=(-0.5, loaded.shape[1] - 0.5), yRange=(-0.5, loaded.shape[0] - 0.5), padding=0.02)
-        self.search()
+        if self.auto.isChecked():
+            self.process()
+        self.update_waiting()
 
-    def search(self):
-        """Find the contacts with the options shown, in the background. While a search runs, the newest options wait
-        for it (_searched starts them)."""
+    def process(self):
+        """Run the workflow as it is now on the image, in the background. While a run is on its way, the newest
+        steps wait for it (_processed starts them)."""
         self.timer.stop()
         if self.loaded is None:
             return
-        self.request += 1  # the result of any earlier search is out of date now
+        self.request += 1  # the result of any earlier run is out of date now
         if not self.running:
             self._start()
+        self.update_waiting()
 
     def _start(self):
         self.running = True
-        number, loaded, options = self.request, self.loaded, self.options()
-        self.busy.setText(f"Finding the {options['pattern']}...")
+        number, version, loaded, steps, earlier = self.request, self.version, self.loaded, copy.deepcopy(self.steps), \
+            self.result
 
         def work():
             try:
-                found = find(loaded, options)
-            except Exception as error:  # shown in the window
-                found = error
+                run = run_workflow(loaded, steps, earlier)  # a step that fails is in the run
+            except Exception as error:  # anything else: shown as a run that failed at once, not a window that waits
+                run = Run(loaded, steps, [State(loaded)], [], error)
             try:
-                self.searched.emit(number, found)
+                self.processed.emit(number, version, run)
             except RuntimeError:  # the window was closed meanwhile
                 pass
         threading.Thread(target=work, daemon=True).start()
 
-    def _searched(self, number: int, found):
+    def _processed(self, number: int, version: int, run: Run):
         self.running = False
-        if number != self.request:  # the image or the options changed meanwhile: search with the newest
+        if number != self.request:  # the image or the steps changed meanwhile: run the newest
+            if run.image is self.loaded:
+                self.result, self.result_version = run, version  # its first steps may serve the next run
             self._start()
             return
-        self.busy.setText("")
-        self.result = None if isinstance(found, Exception) else found
+        self.result, self.result_version = run, version
+        self.update_list()
         self.show_result()
-        if isinstance(found, Exception):
-            self.summary.setText(f"<span style='color:{FAILURE}'>No {self.options()['pattern']} found: "
-                                 f"{type(found).__name__}: "
-                                 f"{html.escape(str(found))}</span>")
+        self.update_waiting()
+
+    # --- The plot -----------------------------------------------------------------------------------------------------
+
+    def viewed(self) -> int:
+        """Which state of the run the plot shows: after the last step that ran, or after the step selected (as far
+        as the run got)."""
+        last = len(self.result.states) - 1
+        if self.view_buttons["selected step"].isChecked() and self.selected() is not None:
+            return min(self.selected() + 1, last)
+        return last
 
     def show_result(self):
-        """Show the image and the contacts found in it (none yet: the image as loaded alone)."""
+        """Show the image and what the workflow made of it, at the step shown (no run yet: the image as loaded)."""
         self.show_image()
-        found = self.result
-        if found is None:
-            self.items["Threshold mask"].clear()
-            for name in LAYERS[1:]:
+        run = self.result
+        self.legend_names = {}
+        if run is None:
+            self.items["Mask"].clear()
+            for name in ("Contours", "Contours before", "Centres"):
                 self.items[name].setData([], [])
         else:
-            self.items["Threshold mask"].setImage(found.mask, levels=(0, 1))
-            place(self.items["Threshold mask"], found.image.shape)
-            for name, contacts in (("Detected", found.detected), ("Refined", found.refined)):
-                if isinstance(contacts, Contours):  # pattern contours: closed or open, no centres
-                    xy, centres = outlines(contacts.points, contacts.closed), np.empty((0, 2))
-                else:
-                    xy, centres = outlines(contacts.contours), np.asarray(contacts.centers, float).reshape(-1, 2)
-                self.items[f"{name} contours"].setData(xy[:, 0], xy[:, 1], connect="finite")
-                self.items[f"{name} centres"].setData(centres[:, 0], centres[:, 1])
-            self.summary.setText(summary(found))
+            viewed = self.viewed()
+            state = run.states[viewed]
+            if state.mask is None:
+                self.items["Mask"].clear()
+            else:
+                self.items["Mask"].setImage(state.mask, levels=(0, 1))
+                place(self.items["Mask"], np.array(state.mask.shape) / state.scale)
+            after = made_by(run, viewed)
+            before = None if after is None else made_by(run, after - 1)
+            for name, number in (("Contours", after), ("Contours before", before)):
+                contours = None if number is None else image_contours(run.states[number])
+                xy = np.empty((0, 2)) if contours is None else outlines(contours.points, contours.closed)
+                self.items[name].setData(xy[:, 0], xy[:, 1], connect="finite")
+                if contours is not None:  # named by the step that made them
+                    self.legend_names[name] = f"{step_title(run.steps, number - 1)}" + (" (before)" if "before" in name else "")
+            contours = image_contours(state)
+            centres = [polygon_centroid(points) for points, closed in zip(contours.points, contours.closed) if closed] \
+                if contours is not None else []
+            centres = np.array(centres, float).reshape(-1, 2)
+            self.items["Centres"].setData(centres[:, 0], centres[:, 1])
+            self.summary.setText(summary(run, viewed))
         self.update_layers()
 
-    def show_image(self, *_):
-        """Show the image as prepared or the original, as loaded (Image), under the layers; data bar cropped once the
-        contacts are found."""
+    def show_image(self):
+        """Show the image as the workflow made it at the step shown, or the original, as loaded (Image), under the
+        layers."""
         if self.loaded is None:
             return
-        found = self.result
-        if found is None:
+        if self.result is None or self.image_buttons["original"].isChecked():
             self.frame, self.displayed = self.loaded.shape, self.loaded
         else:
-            original = self.image_buttons["original"].isChecked()
-            self.frame, self.displayed = found.image.shape, found.image if original else found.prepared
+            state = self.result.states[self.viewed()]
+            self.frame, self.displayed = tuple(np.array(state.image.shape) / state.scale), state.image
         self.image_item.setImage(self.displayed, levels=(0, 255))
         place(self.image_item, self.frame)
 
     def update_layers(self, *_):
-        """Show the layers ticked (and offered); the legend lists the contours and centres shown, each with the
-        detection method or edge rule it comes from."""
-        o = self.result.options if self.result else self.options()
-        shown = self.options()
-        for name in LAYERS[1:]:  # refinement none: the refined ones are the detected; only contacts have centres
-            self.boxes[name].setEnabled(not (name.startswith("Refined") and shown["refinement"] == "none") and
-                                        not (name.endswith("centres") and shown["pattern"] != "contacts"))
+        """Show the layers ticked that there are; the legend names the contours shown by the step that made them."""
+        state = None if self.result is None else self.result.states[self.viewed()]
+        there = {"Mask": state is not None and state.mask is not None,
+                 "Contours": "Contours" in self.legend_names,
+                 "Contours before": "Contours before" in self.legend_names,
+                 "Centres": state is not None and state.contours is not None and bool(state.contours.closed.any())}
         for name, item in self.items.items():
-            item.setVisible(self.boxes[name].isChecked() and self.boxes[name].isEnabled())
+            self.boxes[name].setEnabled(there[name])
+            item.setVisible(self.boxes[name].isChecked() and there[name])
         self.legend.clear()
-        for name in LAYERS[1:]:
+        for name, text in self.legend_names.items():
             if self.items[name].isVisible():
-                self.legend.addItem(self.items[name], f"{name} ({o['detection' if 'Detected' in name else 'refinement']})")
+                self.legend.addItem(self.items[name], text)
+        self.legend.setVisible(bool(self.legend.items))  # no empty box
 
     def _show_cursor(self, scene_pos):
         """The cursor's position and the grey level of the pixel under it in the image shown (upscaled: of its own,
@@ -530,11 +789,19 @@ class Viewer(QtWidgets.QMainWindow):
         if self.displayed is None:
             return
         pos = self.plot.plotItem.vb.mapSceneToView(scene_pos)
-        f = self.displayed.shape[1] // self.frame[1]
+        f = self.displayed.shape[1] / self.frame[1]
         column, row = int(np.floor((pos.x() + 0.5) * f)), int(np.floor((pos.y() + 0.5) * f))
         rows, cols = self.displayed.shape
         grey = f", grey level {self.displayed[row, column]}" if 0 <= row < rows and 0 <= column < cols else ""
         self.statusBar().showMessage(f"x = {pos.x():.1f} px, y = {pos.y():.1f} px{grey}")
+
+    def open_file(self, path: str):
+        """Open a file dropped or named: a workflow if it is a .json file, an image otherwise."""
+        if Path(path).suffix.lower() == ".json":
+            if self.may_replace():
+                self.open_workflow(path)
+        else:
+            self.open_image(path)
 
     def dragEnterEvent(self, event):
         if dropped_file(event.mimeData()):
@@ -544,12 +811,7 @@ class Viewer(QtWidgets.QMainWindow):
         path = dropped_file(event.mimeData())
         if path:
             event.acceptProposedAction()
-            self.open_image(path)
-
-
-def tip(text: str) -> str:
-    """A tooltip that wraps its lines (Qt wraps rich text only)."""
-    return f"<p>{html.escape(text)}</p>"
+            self.open_file(path)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -557,8 +819,8 @@ def main(argv: list[str] | None = None) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(argv)
     window = Viewer()
     window.show()
-    if len(argv) > 1:
-        window.open_image(argv[1])
+    for path in argv[1:]:
+        window.open_file(path)
     return app.exec()
 
 

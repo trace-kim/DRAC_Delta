@@ -15,6 +15,12 @@ extract_any_contours (pipeline.py) runs the same steps but the check for the con
 (contacts.Contours): every region's whole boundary, closed, or open where the region runs out of the image
 (detect_contours), each point moved along the direction its edge faces (refine_contours).
 
+A workflow (workflow.py) is the same steps, and more, as single modules (modules.py: Gaussian blur, non-local means,
+Otsu threshold, Canny edges, Trace regions, Refine edges, ...) in a list of the user's making, designed in the viewer
+(viewer.py), kept in a JSON file, and run with no window:
+
+    contours = workflow_contours(load_sem_image(path), load_workflow("my workflow.json"))
+
 Coordinates are in the pixel frame: (x, y) = (column, row) in pixels, y pointing DOWN, pixel centres at integer
 values, (0, 0) the centre of the top-left pixel.
 
