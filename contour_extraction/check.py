@@ -3,12 +3,15 @@
 Thresholding always finds two classes, even in an image without pattern, so detection cuts regions out of noise too.
 contact_contrast() gives the contrast of each contour against a ring around it, in noise sigma: about one for those
 regions, many for real contacts; keep_contacts() keeps the contacts chosen.
+
+For the contours of any pattern (contacts.Contours): contour_solidity() tells a dented outline from a convex one, and
+keep_contours() keeps the contours chosen.
 """
 
 import cv2
 import numpy as np
 
-from .contacts import DetectedContacts
+from .contacts import Contours, DetectedContacts, polygon_area
 
 
 def noise_sigma(image: np.ndarray, blur_sigma: float = 1.5) -> float:
@@ -44,3 +47,20 @@ def keep_contacts(contacts: DetectedContacts, keep: np.ndarray) -> DetectedConta
     """The contacts where keep (N,) bool is True, in the same order."""
     return DetectedContacts(contacts.centers[keep], contacts.areas[keep],
                             [c for c, k in zip(contacts.contours, keep) if k], contacts.threshold, contacts.left_out)
+
+
+def contour_solidity(points: np.ndarray) -> float:
+    """Area of a closed contour (M, 2) / area of its convex hull: 1 for a convex contour, less the deeper it is
+    dented (0: no area)."""
+    hull_area = cv2.contourArea(cv2.convexHull(points.astype(np.float32)))
+    return polygon_area(points) / hull_area if hull_area > 0 else 0.0
+
+
+def keep_contours(contours: Contours, keep: np.ndarray, left_out: dict[str, int] | None = None) -> Contours:
+    """The contours where keep (N,) bool is True, in the same order. left_out: how many of the others were left out,
+    per reason, added to the counts they have."""
+    counts = dict(contours.left_out)
+    for reason, count in (left_out or {}).items():
+        counts[reason] = counts.get(reason, 0) + count
+    return Contours([p for p, k in zip(contours.points, keep) if k], [n for n, k in zip(contours.normals, keep) if k],
+                    contours.closed[keep], contours.region[keep], contours.threshold, counts)

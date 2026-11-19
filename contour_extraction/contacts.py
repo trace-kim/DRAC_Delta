@@ -22,12 +22,15 @@ class DetectedContacts:
 @dataclass
 class Contours:
     """The contours of any pattern in one image (detect.detect_contours): each a run of edge points in order, each
-    point with the direction its edge faces, out of its region."""
+    point with the direction its edge faces, out of its region. Those of Canny's edges (detect.edge_contours) bound no
+    region: they face the brighter side."""
     points: list[np.ndarray]   # N arrays (M, 2): the points of each contour, in order, (x, y) px
     normals: list[np.ndarray]  # N arrays (M, 2): at each point the unit direction its edge faces, out of its region
     closed: np.ndarray         # (N,) bool: the last point joins the first; False: both ends at the image border
-    region: np.ndarray         # (N,) number of the region each contour bounds (with a hole, or cut: several of one)
-    threshold: float           # the detection's threshold (grey level)
+    #                            (edge_contours: wherever the edge ends)
+    region: np.ndarray         # (N,) number of the region each contour bounds (with a hole, or cut: several of one;
+    #                            edge_contours: 0, none)
+    threshold: float           # the detection's threshold (grey level; NaN: none, edge_contours)
     left_out: dict[str, int] = field(default_factory=dict)  # regions without a contour, per reason (CONTOUR_LEFT_OUT)
 
 

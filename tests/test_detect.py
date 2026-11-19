@@ -2,10 +2,12 @@ import cv2
 import numpy as np
 import pytest
 
-from contour_extraction.detect import detect_contours, inside_image,detect_contacts
+from contour_extraction.detect import (canny_edges, contact_mask, detect_contacts, detect_contours, edge_chains,
+                                       edge_contours, inside_image, mask_contours)
 from contour_extraction.load import crop_databar, load_sem_image
 from contour_extraction.prepare import flatten_background
-from synthetic import ramp_image, wide_band_image, write_sem_like
+from synthetic import (VERTICAL_EDGES_X, across_diagonal, banded_image, diagonal_line, ramp_image, ring, shape_image,
+                       vertical_lines, wide_band_image, write_sem_like)
 
 
 def nearest_distances(found, truth):
@@ -139,3 +141,144 @@ def test_band_method_does_not_need_holes_darker_than_the_background():
 def test_solidity_filter_drops_the_pinched_off_background():
     image, truth = wide_band_image(band_px=16)
     assert len(detect_contacts(image, method="band", min_solidity=0.0).centers) > len(truth)
+
+
+# --- mask_contours: the contours of a mask made any way ---------------------------------------------------------------
+
+def test_mask_contours_of_the_threshold_mask_are_those_of_detect_contours():
+    image = shape_image(ring, noise=4)
+    mask, threshold = contact_mask(image, dark_contacts=False)
+
+    contours, labels = mask_contours(mask, threshold=threshold)
+
+    detected, their_labels = detect_contours(image, dark=False)
+    assert len(contours.points) == len(detected.points) == 2
+    for ours, theirs in zip(contours.points + contours.normals, detected.points + detected.normals):
+        np.testing.assert_array_equal(ours, theirs)
+    np.testing.assert_array_equal(labels, their_labels)
+    assert contours.threshold == detected.threshold and contours.left_out == detected.left_out
+
+
+def test_mask_contours_can_leave_out_the_holes_and_the_regions_at_the_image_border():
+    mask = np.zeros((60, 80), np.uint8)
+    cv2.circle(mask, (25, 30), 15, 1, 6)  # a ring: an outer boundary and a hole's
+    mask[20:40, 60:] = 1  # a region that runs out of the image
+
+    everything, _ = mask_contours(mask)
+    outer, _ = mask_contours(mask, holes=False)
+    inside, _ = mask_contours(mask, open_at_border=False)
+
+    assert sorted(everything.closed) == [False, True, True]
+    assert sorted(outer.closed) == [False, True]
+    assert max(map(len, outer.points)) == max(map(len, everything.points))  # the ring's outer boundary
+    assert list(inside.closed) == [True, True] and inside.left_out == {"border": 1, "small": 0, "large": 0}
+
+
+# --- Canny's edges, followed into contours ---------------------------------------------------------------------------
+
+def line_mask(pixels, shape=(30, 30)):
+    mask = np.zeros(shape, np.uint8)
+    for x, y in pixels:
+        mask[y, x] = 1
+    return mask
+
+
+def joined(pixels: np.ndarray, closed: bool) -> bool:
+    """Whether each pixel of a chain touches the next (and the last the first, if closed)."""
+    steps = np.abs(np.diff(np.vstack([pixels, pixels[:1]]) if closed else pixels, axis=0)).max(axis=1)
+    return bool((steps == 1).all())
+
+
+def test_edge_chains_follow_an_open_line_from_one_end_to_the_other_wherever_the_walk_begins():
+    """cv2.findContours begins at the topmost pixel: an end of the vertical line, the middle of the ^."""
+    vertical = [(10, y) for y in range(5, 20)]
+    hat = [(15 - k, 10 + k) for k in range(8)] + [(15 + k, 10 + k) for k in range(1, 8)]
+    for pixels, ends in ((vertical, {(10, 5), (10, 19)}), (hat, {(8, 17), (22, 17)})):
+        (chain, closed), = edge_chains(line_mask(pixels))
+        assert not closed and len(chain) == 15 and joined(chain, closed)
+        assert {tuple(map(int, chain[0])), tuple(map(int, chain[-1]))} == ends
+
+
+def test_edge_chains_keep_a_closed_line_closed_and_take_its_spur_off():
+    loop = np.zeros((30, 30), np.uint8)
+    cv2.rectangle(loop, (5, 5), (20, 18), 1, 1)
+    (chain, closed), = edge_chains(loop)
+    assert closed and len(chain) == 52 and joined(chain, closed)  # 56 pixels, without its four corners (thinned)
+
+    for spur in ([(x, 5) for x in range(21, 27)], [(12, y) for y in range(1, 5)]):  # the walk begins on the second
+        with_spur = loop.copy()
+        for x, y in spur:
+            with_spur[y, x] = 1
+        chains = edge_chains(with_spur)
+        assert [closed for _, closed in chains] == [True, False]
+        assert len(chains[0][0]) >= 52 and joined(*chains[0]) and len(chains[1][0]) <= len(spur)
+
+
+def test_edge_chains_follow_a_staircase_whose_steps_overlap_as_one_line():
+    """Canny's slanted edges: rows of pixels, each beginning under the end of the one above. Round such a line the
+    walk comes back over other pixels than it went out on, unless the line is thinned first."""
+    stairs = line_mask([(3 * k + dx, 5 + k) for k in range(7) for dx in range(4)])
+    (chain, closed), = edge_chains(stairs)
+    assert not closed and joined(chain, closed) and 15 <= len(chain) < stairs.sum()
+    assert {int(chain[0][0]), int(chain[-1][0])} == {0, 21}  # from its one end to its other
+
+    image = shape_image(diagonal_line, noise=8)
+    contours = edge_contours(canny_edges(image)[0], image)
+    assert len(contours.points) == 2 and not contours.closed.any() and min(map(len, contours.points)) > 280
+    for points in contours.points:  # each pixel put on the edge, between the pixels: 12 px from the line's middle
+        np.testing.assert_allclose(np.abs(across_diagonal(points[5:-5, 0], points[5:-5, 1])), 12, atol=0.25)
+
+
+def test_edge_chains_find_nested_closed_lines_and_split_a_branching_one():
+    nested = np.zeros((30, 30), np.uint8)
+    cv2.circle(nested, (15, 15), 10, 1, 1)
+    cv2.circle(nested, (15, 15), 5, 1, 1)
+    assert sorted((len(chain), closed) for chain, closed in edge_chains(nested)) == [(28, True), (56, True)]
+
+    tee = line_mask([(x, 15) for x in range(3, 27)] + [(15, y) for y in range(5, 15)])
+    chains = edge_chains(tee)
+    assert len(chains) == 2 and not any(closed for _, closed in chains)
+    assert sum(len(chain) for chain, _ in chains) == 34 and all(joined(*chain) for chain in chains)
+    assert edge_chains(np.zeros((30, 30), np.uint8)) == []
+
+
+@pytest.mark.parametrize("noise", [0, 8, 20])
+def test_canny_edges_of_a_ring_are_two_closed_lines_on_its_edges(noise):
+    image = shape_image(ring, noise=noise)
+
+    edges, high = canny_edges(image)
+    contours = edge_contours(edges, image)
+
+    assert high > 0 and set(np.unique(edges)) == {0, 1}
+    assert len(contours.points) == 2 and contours.closed.all()
+    radii = sorted(np.hypot(*(points - [150, 100]).T).mean() for points in contours.points)
+    np.testing.assert_allclose(radii, (30.4, 55.2), atol=0.12)  # between the pixels (gradient_peaks)
+    for points, normals in zip(contours.points, contours.normals):  # facing the brighter side: into the ring
+        radius = np.hypot(*(points - [150, 100]).T)
+        outward = (normals * (points - [150, 100])).sum(axis=1) / radius
+        np.testing.assert_allclose(outward, 1 if radius.mean() < 40 else -1, atol=0.1)
+    assert np.isnan(contours.threshold) and not contours.region.any()
+
+
+def test_canny_edges_of_lines_running_out_of_the_image_are_open_one_per_edge():
+    image = shape_image(vertical_lines, noise=8)
+    contours = edge_contours(canny_edges(image)[0], image)
+    assert len(contours.points) == 4 and not contours.closed.any()
+    order = np.argsort([points[:, 0].mean() for points in contours.points])
+    for k, x_edge, faces in zip(order, VERTICAL_EDGES_X, (1, -1, 1, -1)):  # each faces into its (bright) line
+        np.testing.assert_allclose(contours.points[k][:, 0].mean(), x_edge, atol=0.08)
+        np.testing.assert_allclose(contours.points[k][:, 0], x_edge, atol=0.4)
+        np.testing.assert_allclose(contours.normals[k][10:-10], np.tile([faces, 0.0], (len(contours.points[k]) - 20, 1)),
+                                   atol=0.35)
+
+
+def test_canny_edges_give_each_bright_band_two_contours_and_short_lines_are_left_out():
+    centres = [(30, 30), (70, 30), (30, 70), (70, 70)]
+    image = banded_image(centres, [10] * 4, 100, noise=6)
+    edges, high = canny_edges(image)
+
+    contours = edge_contours(edges, image)
+    assert len(contours.points) == 8 and contours.closed.all()  # the inner and the outer slope of each band
+    longer = edge_contours(edges, image, min_points=70)
+    assert len(longer.points) == 4 and longer.left_out == {"short": 4}  # the outer ones only
+    assert canny_edges(image, high=2 * high)[0].sum() < edges.sum()  # a higher threshold: fewer edge pixels

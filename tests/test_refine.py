@@ -2,10 +2,11 @@ import cv2
 import numpy as np
 import pytest
 
+from contour_extraction.contacts import Contours, polygon_area
 from contour_extraction.detect import detect_contacts
 from contour_extraction.load import load_sem_image
 from contour_extraction.refine import (RULES, crossings, edge_offsets, level_offsets, outward_normals, refine_edges,
-                                       sample_profiles, without_isolated)
+                                       sample_profiles, smoothed_contours, without_isolated)
 from synthetic import banded_image, centre_errors, exact_ellipse_image, no_band_image, write_sem_like
 
 
@@ -206,3 +207,25 @@ def test_unknown_rule_is_refused():
     image = exact_ellipse_image((40, 40), (20, 12))
     with pytest.raises(ValueError, match="rule"):
         refine_edges(image, detect_contacts(image, blur_sigma=0), rule="steepest")
+
+
+def test_smoothed_contours_take_out_the_scatter_without_shrinking_a_circle():
+    angles = np.linspace(0, 2 * np.pi, 120, endpoint=False)
+    radial = np.column_stack([np.cos(angles), np.sin(angles)])
+    scatter = np.random.default_rng(0).normal(0, 0.3, 120)
+    circle = [50, 40] + (20 + scatter)[:, None] * radial
+    line = np.column_stack([np.arange(60.0), 10 + 0.05 * np.arange(60.0) + scatter[:60]])  # open, straight
+    contours = Contours([circle, line, circle[:5]], [radial, radial[:60], radial[:5]], np.array([True, False, True]),
+                        np.array([1, 2, 3]), 97.0)
+
+    smooth = smoothed_contours(contours, window=15)
+
+    radius = np.hypot(*(smooth.points[0] - [50, 40]).T)
+    assert radius.std() < 0.6 * scatter.std()
+    assert abs(radius.mean() - 20) < 0.05 and abs(polygon_area(smooth.points[0]) / (np.pi * 20 ** 2) - 1) < 0.01
+    off_line = smooth.points[1][:, 1] - (10 + 0.05 * smooth.points[1][:, 0])
+    assert off_line.std() < 0.7 * scatter[:60].std() and len(smooth.points[1]) == 60
+    assert smooth.points[2] is contours.points[2]  # fewer points than the window: as it is
+    assert smooth.normals is contours.normals and smooth.threshold == 97.0
+    with pytest.raises(ValueError, match="window"):
+        smoothed_contours(contours, window=4)

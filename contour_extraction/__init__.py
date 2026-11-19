@@ -25,9 +25,14 @@ from .contacts import Contours, DetectedContacts, polygon_area, polygon_centroid
 from .load import crop_databar, load_sem_image
 from .prepare import (DENOISERS, NLM_PATCH_PX, NLM_SEARCH_PX, denoised_image, flatten_background, in_image_contours,
                       in_image_pixels, prepared_image, upscaled_image)
-from .detect import (BAND_MIN_SOLIDITY, CONTOUR_LEFT_OUT, LEFT_OUT, METHODS, contact_mask, detect_contacts,
-                     detect_contours, inside_image, out_of_polygon, outer_contour, right_of_tangent, solidity)
-from .check import contact_contrast, keep_contacts, noise_sigma
+from .detect import (BAND_MIN_SOLIDITY, CANNY_TOP_SHARE, CONTOUR_LEFT_OUT, LEFT_OUT, METHODS, canny_edges, contact_mask,
+                     detect_contacts, detect_contours, edge_chains, edge_contours, gradient_peaks, inside_image,
+                     mask_contours, out_of_polygon, outer_contour, right_of_tangent, sampled, solidity, walk_chains)
+from .check import contact_contrast, contour_solidity, keep_contacts, keep_contours, noise_sigma
 from .refine import (RULES, crossings, edge_offsets, interior_level, level_offsets, mid_level_shifts, mid_levels,
-                     outward_normals, refine_contours, refine_edges, sample_profiles, without_isolated)
+                     outward_normals, refine_contours, refine_edges, sample_profiles, smoothed_contours,
+                     without_isolated)
 from .pipeline import REFINEMENTS, extract_any_contours, extract_contours
+from .modules import MODULES, STAGES, Module, Option, State, WorkflowError, image_contours
+from .workflow import (PRESETS, Run, Step, load_workflow, preset, run_workflow, save_workflow, step, workflow_contours,
+                       workflow_data, workflow_steps)

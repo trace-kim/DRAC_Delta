@@ -6,7 +6,8 @@ No radius or centre is assumed, so this works for any contact shape (circle, ell
 centre is the area centroid of the refined contour.
 
 refine_contours() does the same for the contours of any pattern (detect.detect_contours), closed or open: each point
-moves along the direction its edge faces, given by the detection, by the same rules.
+moves along the direction its edge faces, given by the detection, by the same rules. smoothed_contours() then takes
+the point-to-point scatter out of them.
 """
 
 import warnings
@@ -15,6 +16,7 @@ from collections import defaultdict
 import cv2
 import numpy as np
 from scipy import ndimage
+from scipy.signal import savgol_filter
 
 from .contacts import Contours, DetectedContacts, polygon_area, polygon_centroid
 
@@ -240,3 +242,19 @@ def mid_levels(signed: np.ndarray, labels: np.ndarray, region: np.ndarray, parts
     for number, part in zip(region, parts):
         brightest[number].append(part[:, offsets >= 0].max(axis=1))
     return [(interior[number] + np.median(np.concatenate(brightest[number]))) / 2 for number in region]
+
+
+def smoothed_contours(contours: Contours, window: int = 9) -> Contours:
+    """The contours with the scatter of their points smoothed out along each contour: every point's x and y are
+    those of a cubic fitted to the `window` points around it (Savitzky-Golay; window odd, 5 or more), round a closed
+    contour, and at the ends of an open one fitted to the points there are.
+
+    A cubic follows a curved edge, where a moving average cuts the curve short and so shrinks a closed contour (a
+    circle of radius R, averaged with a Gaussian of sigma s points, by about s^2 / 2R). Contours of fewer points than
+    the window stay as they are; the normals are not changed.
+    """
+    if window < 5 or window % 2 == 0:
+        raise ValueError(f"window must be odd and 5 or more, not {window}")
+    points = [savgol_filter(p, window, 3, axis=0, mode="wrap" if whole else "interp") if len(p) >= window else p
+              for p, whole in zip(contours.points, contours.closed)]
+    return Contours(points, contours.normals, contours.closed, contours.region, contours.threshold, contours.left_out)
